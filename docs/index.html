@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Polymarket Bot</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+
+    <!-- Header -->
+    <header>
+      <div class="header-left">
+        <div class="logo">P</div>
+        <h1 id="page-title">Polymarket Bot</h1>
+        <div class="badges">
+          <span id="status-badge" class="badge badge-running"><span class="pulse"></span>Running</span>
+          <span id="mode-badge" class="badge badge-dry-run">Dry Run</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="lang-toggle">
+          <button data-lang="en">EN</button>
+          <button data-lang="pt">PT</button>
+        </div>
+        <span id="last-updated" class="last-updated"></span>
+      </div>
+    </header>
+
+    <!-- Metric Cards -->
+    <div class="metrics">
+      <div class="metric-card">
+        <div class="metric-icon capital">$</div>
+        <div class="metric-label" id="capital-label">Total Capital</div>
+        <div class="metric-value" id="capital-value">$0.00</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon pnl-today">~</div>
+        <div class="metric-label" id="today-pnl-label">Today's P&L</div>
+        <div class="metric-value" id="today-pnl-value">$0.00</div>
+        <div class="metric-sub" id="today-pnl-pct"></div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon pnl-total">#</div>
+        <div class="metric-label" id="total-pnl-label">Total P&L</div>
+        <div class="metric-value" id="total-pnl-value">$0.00</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon exposure">!</div>
+        <div class="metric-label" id="exposure-label">Exposure</div>
+        <div class="metric-value" id="exposure-value">$0.00</div>
+        <div class="metric-sub" id="exposure-pct"></div>
+      </div>
+    </div>
+
+    <!-- Strategies + P&L Chart -->
+    <div class="grid-2">
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title" id="strategies-title">Strategies</span>
+        </div>
+        <div class="strategies-grid" id="strategies-list"></div>
+      </div>
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title" id="chart-title">Recent P&L</span>
+        </div>
+        <div class="chart-container">
+          <canvas id="pnl-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Open Positions -->
+    <div class="grid-full">
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title" id="positions-title">Open Positions</span>
+          <span class="section-count" id="positions-count">0</span>
+        </div>
+        <table id="positions-table">
+          <thead>
+            <tr>
+              <th id="th-market">Market</th>
+              <th id="th-side">Side</th>
+              <th id="th-entry">Entry</th>
+              <th id="th-current">Current</th>
+              <th id="th-size">Size</th>
+              <th id="th-pnl">P&L</th>
+            </tr>
+          </thead>
+          <tbody id="positions-body"></tbody>
+        </table>
+        <div class="empty-state" id="positions-empty" style="display:none">
+          <div class="empty-state-icon">-</div>
+          <div id="positions-empty-text">No open positions</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Trades -->
+    <div class="grid-full">
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title" id="trades-title">Recent Trades</span>
+          <span class="section-count" id="trades-count">0</span>
+        </div>
+        <table id="trades-table">
+          <thead>
+            <tr>
+              <th id="th-t-market">Market</th>
+              <th id="th-t-side">Side</th>
+              <th id="th-t-entry">Entry</th>
+              <th id="th-t-exit">Exit</th>
+              <th id="th-t-pnl">P&L</th>
+              <th id="th-t-time">Time</th>
+            </tr>
+          </thead>
+          <tbody id="trades-body"></tbody>
+        </table>
+        <div class="empty-state" id="trades-empty" style="display:none">
+          <div class="empty-state-icon">-</div>
+          <div id="trades-empty-text">No closed trades yet</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      Polymarket Autonomous Trading Bot &mdash; <a href="https://github.com">View on GitHub</a>
+    </div>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

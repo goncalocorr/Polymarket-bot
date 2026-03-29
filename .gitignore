@@ -1,0 +1,43 @@
+# Environment
+.env
+.env.local
+.env*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data
+data/*.db
+data/*.parquet
+logs/
+*.log
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ChromaDB
+chroma_data/
+
+# Claude Code
+.claude/

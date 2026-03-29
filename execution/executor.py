@@ -1,0 +1,195 @@
+"""
+Three-Phase Order Executor — progressively adjusts price to get fills.
+Ported from zydomus219/Polymarket-betting-bot (TypeScript → Python).
+"""
+
+import asyncio
+from dataclasses import dataclass
+from typing import Optional
+
+from loguru import logger
+
+import config
+from core.bot import TradingBot
+
+
+@dataclass
+class ExecutionResult:
+    """Result of a three-phase execution attempt."""
+
+    filled: bool
+    fill_price: float
+    fill_size: float
+    phases_used: int
+    order_id: str = ""
+    error: str = ""
+
+
+class ThreePhaseExecutor:
+    """
+    Attempts to fill an order across up to 3 phases with progressive price adjustments.
+
+    Phase 1: place at current price, wait PHASE1_TIMEOUT
+    Phase 2: adjust price +PHASE2_INCREMENT cents, reduce size 5%, wait PHASE2_TIMEOUT
+    Phase 3: adjust price +PHASE3_INCREMENT cents, reduce size another 5%, final attempt
+    """
+
+    def __init__(self, bot: TradingBot):
+        self.bot = bot
+
+    async def execute(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str,
+    ) -> ExecutionResult:
+        """Execute an order using the three-phase approach."""
+        remaining_size = size
+        total_filled = 0.0
+        total_cost = 0.0  # For VWAP fill price
+
+        for phase in range(1, 4):
+            if remaining_size < config.MIN_ORDER_SIZE_USDC:
+                logger.warning(
+                    f"Phase {phase}: Remaining size {remaining_size:.2f} "
+                    f"below minimum {config.MIN_ORDER_SIZE_USDC}"
+                )
+                break
+
+            # Calculate phase-specific parameters
+            if phase == 1:
+                phase_price = price
+                timeout = config.PHASE1_TIMEOUT_S
+            elif phase == 2:
+                phase_price = min(price + config.PHASE2_INCREMENT_CENTS / 100, 0.99)
+                remaining_size *= 0.95
+                timeout = config.PHASE2_TIMEOUT_S
+            else:
+                phase_price = min(
+                    price
+                    + (config.PHASE2_INCREMENT_CENTS + config.PHASE3_INCREMENT_CENTS)
+                    / 100,
+                    0.99,
+                )
+                remaining_size *= 0.95
+                timeout = config.PHASE3_TIMEOUT_S
+
+            logger.info(
+                f"Phase {phase}: {side} {remaining_size:.2f} USDC "
+                f"at {phase_price:.4f} (timeout: {timeout}s)"
+            )
+
+            # Place order
+            result = await self.bot.place_order(
+                token_id=token_id,
+                price=phase_price,
+                size=remaining_size,
+                side=side,
+            )
+
+            if not result:
+                return ExecutionResult(
+                    filled=False,
+                    fill_price=0,
+                    fill_size=0,
+                    phases_used=phase,
+                    error="Order placement failed",
+                )
+
+            order_id = result.get("id", "")
+
+            if config.DRY_RUN:
+                return ExecutionResult(
+                    filled=True,
+                    fill_price=phase_price,
+                    fill_size=remaining_size,
+                    phases_used=phase,
+                    order_id=order_id,
+                )
+
+            # Wait for fill
+            filled_size = await self._wait_for_fill(order_id, timeout)
+
+            if filled_size < 0:
+                # API unreachable — don't cancel (order may be filled on-chain)
+                logger.warning(
+                    f"Phase {phase}: Cannot confirm fill status for {order_id}, "
+                    f"skipping cancel to avoid double-execution"
+                )
+                return ExecutionResult(
+                    filled=False,
+                    fill_price=0,
+                    fill_size=0,
+                    phases_used=phase,
+                    order_id=order_id,
+                    error="API unreachable — order status unknown",
+                )
+
+            if filled_size >= remaining_size * 0.95:
+                # Fully filled (within 5% tolerance)
+                total_filled += filled_size
+                total_cost += filled_size * phase_price
+                return ExecutionResult(
+                    filled=True,
+                    fill_price=total_cost / total_filled if total_filled > 0 else phase_price,
+                    fill_size=total_filled,
+                    phases_used=phase,
+                    order_id=order_id,
+                )
+
+            # Partially filled or unfilled — cancel remaining
+            if filled_size > 0:
+                total_filled += filled_size
+                total_cost += filled_size * phase_price
+                remaining_size -= filled_size
+                logger.info(
+                    f"Phase {phase}: Partially filled {filled_size:.2f} USDC, "
+                    f"{remaining_size:.2f} remaining"
+                )
+
+            await self.bot.cancel_order(order_id)
+
+        avg_price = total_cost / total_filled if total_filled > 0 else price
+        return ExecutionResult(
+            filled=False,
+            fill_price=avg_price,
+            fill_size=total_filled,
+            phases_used=3,
+            error="All phases exhausted",
+        )
+
+    async def _wait_for_fill(self, order_id: str, timeout: float) -> float:
+        """
+        Poll order status until filled or timeout.
+        Returns the filled amount in USDC, or -1.0 on transient API failure.
+        """
+        elapsed = 0
+        poll_interval = 2.0
+        consecutive_errors = 0
+
+        while elapsed < timeout:
+            order = await self.bot.get_order(order_id)
+            if not order:
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    logger.warning(f"Order {order_id}: API unreachable after 3 retries")
+                    return -1.0
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                continue
+
+            consecutive_errors = 0
+            status = order.get("status", "")
+            filled = float(order.get("filledSize", 0) or order.get("size_matched", 0))
+
+            if status in ("MATCHED", "FILLED", "filled"):
+                return filled
+
+            if status in ("CANCELLED", "EXPIRED", "cancelled"):
+                return filled
+
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        return 0.0
