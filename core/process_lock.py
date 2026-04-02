@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -41,6 +45,15 @@ class SingleInstanceLock:
                 fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return False
+
+        self._handle.seek(0)
+        self._handle.truncate()
+        self._handle.write(json.dumps({
+            "pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "executable": sys.executable,
+        }))
+        self._handle.flush()
 
         self._locked = True
         return True

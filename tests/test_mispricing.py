@@ -92,6 +92,8 @@ class TestMispricingDetection:
         assert signals[0].estimated_prob == pytest.approx(0.535)
         assert signals[0].take_profit is not None
         assert signals[0].stop_loss is not None
+        assert signals[0].take_profit < 0.535
+        assert signals[0].stop_loss > 0.30
 
     @pytest.mark.asyncio
     async def test_no_signal_when_paused(self, strategy, gamma, external):
@@ -270,6 +272,33 @@ class TestMispricingDetection:
         )
 
     @pytest.mark.asyncio
+    async def test_restore_runtime_state_tightens_legacy_wide_exits(
+        self, gamma, external
+    ):
+        ws = MagicMock()
+        ws.subscribe = AsyncMock()
+        strategy = MispricingStrategy(gamma, external, ws=ws)
+        db = MagicMock()
+        position = SimpleNamespace(
+            id="pos-legacy",
+            token_id="tok_yes",
+            strategy="mispricing",
+            entry_price=0.355,
+            take_profit=0.9758,
+            stop_loss=0.0345,
+        )
+
+        await strategy.restore_runtime_state([position], [], db=db)
+
+        assert position.take_profit == pytest.approx(0.475)
+        assert position.stop_loss == pytest.approx(0.255)
+        db.update_trade_risk_levels.assert_called_once_with(
+            "pos-legacy",
+            position.take_profit,
+            position.stop_loss,
+        )
+
+    @pytest.mark.asyncio
     async def test_restore_runtime_state_recovers_recent_loss_cooldown(
         self, gamma, external
     ):
@@ -316,3 +345,45 @@ class TestMispricingDetection:
         signals = await strategy.evaluate()
 
         assert signals == []
+
+    @pytest.mark.asyncio
+    async def test_skips_signal_when_live_price_removes_positive_edge(
+        self, gamma, external
+    ):
+        ws = MagicMock()
+        ws.subscribe = AsyncMock()
+        ws.get_order_book = MagicMock(return_value={"bids": [], "asks": []})
+        ws.get_mid_price = MagicMock(return_value=0.62)
+        quality = MagicMock()
+        quality.is_tradeable.return_value = (
+            True,
+            MagicMock(total=0.8, is_tradeable=True),
+        )
+        strategy = MispricingStrategy(
+            gamma, external, ws=ws, quality_scorer=quality
+        )
+        gamma.get_markets_for_mispricing.return_value = [
+            {
+                "question": "Will event X happen?",
+                "outcomePrices": "[0.40]",
+                "volume24hr": 10000,
+                "tokens": ["t_yes", "t_no"],
+            }
+        ]
+        external.find_matching_prices.return_value = {"kalshi": 0.55}
+
+        signals = await strategy.evaluate()
+
+        assert signals == []
+
+    def test_signal_exit_levels_stay_responsive_for_large_edges(self, strategy):
+        take_profit, stop_loss = strategy._signal_exit_levels(
+            entry_price=0.355,
+            estimated_prob=0.995,
+            live_edge=0.64,
+        )
+
+        assert take_profit == pytest.approx(0.475)
+        assert stop_loss == pytest.approx(0.255)
+        assert take_profit < 0.995
+        assert stop_loss > 0.10

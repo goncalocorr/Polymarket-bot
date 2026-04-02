@@ -3,6 +3,7 @@ AI Agent Strategy — uses Claude to analyse markets in the grey zone
 where cross-market divergence is ambiguous (5-8%).
 """
 
+import json
 from datetime import datetime, timezone
 
 from loguru import logger
@@ -27,6 +28,7 @@ class AIAgentStrategy(BaseStrategy):
         gamma: GammaClient,
         external: ExternalSources,
         analyst: ClaudeAnalyst,
+        db=None,
         grey_zone_min: float = 0.05,
         grey_zone_max: float = 0.08,
     ):
@@ -34,18 +36,74 @@ class AIAgentStrategy(BaseStrategy):
         self.gamma = gamma
         self.external = external
         self.analyst = analyst
+        self.db = db
         self.grey_zone_min = grey_zone_min
         self.grey_zone_max = grey_zone_max
         self._calls_today = 0
         self._last_reset_date: str = ""
+        self._state_key = "ai_agent:daily_calls"
+
+    def _persist_daily_counter(self):
+        if not self.db or not self._last_reset_date:
+            return
+        self.db.save_state(
+            self._state_key,
+            json.dumps({
+                "date": self._last_reset_date,
+                "calls": self._calls_today,
+            }),
+        )
+
+    def _load_daily_counter(self):
+        if not self.db:
+            return
+
+        raw = self.db.get_state(self._state_key)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if not raw:
+            self._last_reset_date = today
+            self._calls_today = 0
+            self._persist_daily_counter()
+            return
+
+        try:
+            state = json.loads(raw)
+            state_date = str(state.get("date", ""))
+            state_calls = int(state.get("calls", 0) or 0)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            logger.warning("AIAgent: Invalid persisted Claude call counter, resetting")
+            self._last_reset_date = today
+            self._calls_today = 0
+            self._persist_daily_counter()
+            return
+
+        if state_date == today:
+            self._last_reset_date = state_date
+            self._calls_today = max(state_calls, 0)
+            return
+
+        self._last_reset_date = today
+        self._calls_today = 0
+        self._persist_daily_counter()
 
     def _reset_daily_counter(self):
+        if self.db and not self._last_reset_date:
+            self._load_daily_counter()
+
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self._last_reset_date:
             self._calls_today = 0
             self._last_reset_date = today
+            self._persist_daily_counter()
 
     async def initialize(self):
+        self._reset_daily_counter()
+        if not getattr(self.analyst, "api_key", ""):
+            self.disable()
+            logger.warning(
+                "AIAgent: Disabled because ANTHROPIC_API_KEY is not configured"
+            )
+            return
         logger.info("AIAgent: Strategy initialized")
 
     async def evaluate(self) -> list[Signal]:
@@ -60,6 +118,9 @@ class AIAgentStrategy(BaseStrategy):
 
         signals = []
         poly_markets = await self.gamma.get_markets_for_mispricing()
+        markets_with_external = 0
+        grey_zone_candidates = 0
+        claude_calls_this_cycle = 0
 
         for market in poly_markets:
             if self._calls_today >= config.MAX_CLAUDE_CALLS_PER_DAY:
@@ -74,6 +135,7 @@ class AIAgentStrategy(BaseStrategy):
             external_prices = await self.external.find_matching_prices(question)
             if not external_prices:
                 continue
+            markets_with_external += 1
 
             avg_external = sum(external_prices.values()) / len(external_prices)
             divergence = abs(avg_external - poly_price)
@@ -81,6 +143,7 @@ class AIAgentStrategy(BaseStrategy):
             # Only process grey zone divergences
             if not (self.grey_zone_min <= divergence <= self.grey_zone_max):
                 continue
+            grey_zone_candidates += 1
 
             # Fetch recent news for context
             news = await self.external.get_recent_news(question)
@@ -97,6 +160,8 @@ class AIAgentStrategy(BaseStrategy):
             try:
                 analysis = await self.analyst.analyse_market(market_data, news)
                 self._calls_today += 1
+                claude_calls_this_cycle += 1
+                self._persist_daily_counter()
             except Exception as e:
                 logger.error(f"AIAgent: Claude analysis failed for '{question}': {e}")
                 continue
@@ -155,9 +220,20 @@ class AIAgentStrategy(BaseStrategy):
                 f"Claude prob={claude_prob:.2f}, conf={claude_confidence:.2f}"
             )
 
+        logger.debug(
+            "AIAgent: scan summary — "
+            f"markets={len(poly_markets)} "
+            f"external={markets_with_external} "
+            f"grey_zone={grey_zone_candidates} "
+            f"claude_calls={claude_calls_this_cycle} "
+            f"signals={len(signals)} "
+            f"remaining_budget={max(config.MAX_CLAUDE_CALLS_PER_DAY - self._calls_today, 0)}"
+        )
+
         return signals
 
     async def shutdown(self):
+        self._persist_daily_counter()
         logger.info(
             f"AIAgent: Shut down (used {self._calls_today} Claude calls today)"
         )

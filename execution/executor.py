@@ -4,6 +4,7 @@ Ported from zydomus219/Polymarket-betting-bot (TypeScript → Python).
 """
 
 import asyncio
+import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,6 +37,41 @@ class ThreePhaseExecutor:
 
     def __init__(self, bot: TradingBot):
         self.bot = bot
+
+    async def _simulate_dry_run_fill(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str,
+        phase: int,
+        order_id: str,
+    ) -> ExecutionResult:
+        """
+        Simulate a non-perfect dry-run fill.
+
+        Dry run still assumes eventual execution, but adds a small latency and
+        adverse price movement so backtests are not unrealistically optimistic.
+        """
+        delay_s = max(config.DRY_RUN_SIMULATED_DELAY_MS, 0) / 1000
+        if delay_s:
+            await asyncio.sleep(delay_s)
+
+        seed = hashlib.sha256(
+            f"{token_id}:{side}:{phase}:{price:.6f}:{size:.4f}".encode()
+        ).digest()
+        slip_scale = int.from_bytes(seed[:2], "big") / 65535
+        slip_bps = max(config.DRY_RUN_SLIPPAGE_BPS, 0) * (0.4 + 0.6 * slip_scale)
+        slip = max(0.001, price * slip_bps / 10_000)
+        fill_price = min(price + slip, 0.99) if side == "BUY" else max(price - slip, 0.01)
+
+        return ExecutionResult(
+            filled=True,
+            fill_price=fill_price,
+            fill_size=size,
+            phases_used=phase,
+            order_id=order_id,
+        )
 
     async def execute(
         self,
@@ -100,11 +136,12 @@ class ThreePhaseExecutor:
             order_id = result.get("id", "")
 
             if config.DRY_RUN:
-                return ExecutionResult(
-                    filled=True,
-                    fill_price=phase_price,
-                    fill_size=remaining_size,
-                    phases_used=phase,
+                return await self._simulate_dry_run_fill(
+                    token_id=token_id,
+                    price=phase_price,
+                    size=remaining_size,
+                    side=side,
+                    phase=phase,
                     order_id=order_id,
                 )
 

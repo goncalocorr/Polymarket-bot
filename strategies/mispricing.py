@@ -111,6 +111,62 @@ class MispricingStrategy(BaseStrategy):
         stop_loss = max(entry_price - move, 0.01)
         return take_profit, stop_loss
 
+    def _signal_exit_levels(
+        self,
+        entry_price: float,
+        estimated_prob: float,
+        live_edge: float,
+    ) -> tuple[float, float]:
+        """
+        Build more responsive exits for large mispricing gaps.
+
+        We target partial convergence toward fair value instead of waiting for
+        the market to travel all the way to the external estimate. That keeps
+        dry-run and live behaviour closer to realistic holding periods.
+        """
+        fair_gap = max(estimated_prob - entry_price, self.close_threshold)
+        capture_move = min(
+            max(self.close_threshold, fair_gap * 0.45),
+            0.12,
+        )
+        take_profit = min(
+            entry_price + capture_move,
+            estimated_prob - (self.close_threshold * 0.5),
+            0.99,
+        )
+        if take_profit <= entry_price:
+            take_profit = min(entry_price + self.close_threshold, 0.99)
+
+        stop_move = min(
+            max(self.close_threshold, min(live_edge * 0.30, capture_move * 0.85)),
+            0.10,
+        )
+        stop_loss = max(entry_price - stop_move, 0.01)
+        if stop_loss >= entry_price:
+            stop_loss = max(entry_price - self.close_threshold, 0.01)
+
+        return take_profit, stop_loss
+
+    def _restored_exit_levels(
+        self,
+        entry_price: float,
+        current_take_profit: float | None,
+        current_stop_loss: float | None,
+    ) -> tuple[float, float]:
+        """
+        Tighten legacy restored exits that were created by older, overly-wide logic.
+
+        When we only know the open position, infer a conservative fair-value guess
+        from the existing TP and rebuild a more responsive convergence-based range.
+        """
+        inferred_prob = max(
+            entry_price + self.close_threshold,
+            (current_take_profit or entry_price) + self.close_threshold,
+        )
+        inferred_prob = min(inferred_prob, 0.99)
+        inferred_edge = max(inferred_prob - entry_price, self.close_threshold)
+        return self._signal_exit_levels(entry_price, inferred_prob, inferred_edge)
+
     def _in_reentry_cooldown(self, token_id: str) -> bool:
         cooldown_until = self._cooldown_until.get(token_id)
         if not cooldown_until:
@@ -171,18 +227,21 @@ class MispricingStrategy(BaseStrategy):
                 self._subscribed_tokens.add(pos.token_id)
 
             updated_levels = False
-            if pos.take_profit is None or pos.stop_loss is None:
-                take_profit, stop_loss = self._default_exit_levels(pos.entry_price)
-                if pos.take_profit is None:
-                    pos.take_profit = take_profit
-                    updated_levels = True
-                if pos.stop_loss is None:
-                    pos.stop_loss = stop_loss
-                    updated_levels = True
+            target_tp, target_sl = self._restored_exit_levels(
+                pos.entry_price,
+                pos.take_profit,
+                pos.stop_loss,
+            )
+            if pos.take_profit is None or pos.take_profit > target_tp + 0.05:
+                pos.take_profit = target_tp
+                updated_levels = True
+            if pos.stop_loss is None or pos.stop_loss < target_sl - 0.05:
+                pos.stop_loss = target_sl
+                updated_levels = True
 
             if updated_levels:
                 logger.info(
-                    f"Mispricing: Backfilled exits for restored position {pos.id}"
+                    f"Mispricing: Refreshed exits for restored position {pos.id}"
                 )
                 if db:
                     db.update_trade_risk_levels(
@@ -284,7 +343,8 @@ class MispricingStrategy(BaseStrategy):
                     continue
 
             signal_price = self._current_market_price(token_id, snapshot_price)
-            live_edge = abs(traded_estimated_prob - signal_price)
+            signed_edge = traded_estimated_prob - signal_price
+            live_edge = abs(signed_edge)
             if live_edge < self.min_mispricing:
                 logger.debug(
                     f"Mispricing: Skipping '{question[:40]}...' - live edge "
@@ -292,12 +352,26 @@ class MispricingStrategy(BaseStrategy):
                 )
                 continue
 
+            if signed_edge <= 0:
+                logger.debug(
+                    f"Mispricing: Skipping '{question[:40]}...' - no positive edge "
+                    f"after price refresh ({traded_estimated_prob:.3f} <= {signal_price:.3f})"
+                )
+                continue
+
+            if live_edge < config.MIN_KELLY_EDGE:
+                logger.debug(
+                    f"Mispricing: Skipping '{question[:40]}...' - live edge "
+                    f"{live_edge:.3f} below Kelly minimum {config.MIN_KELLY_EDGE:.3f}"
+                )
+                continue
+
             edge_strength = min(live_edge / (self.min_mispricing * 3), 1.0)
             signal_confidence = 0.35 + (edge_strength * 0.40)
-            take_profit = min(traded_estimated_prob - self.close_threshold, 0.99)
-            stop_loss = max(
-                signal_price - max(self.close_threshold, live_edge * 0.5),
-                0.01,
+            take_profit, stop_loss = self._signal_exit_levels(
+                entry_price=signal_price,
+                estimated_prob=traded_estimated_prob,
+                live_edge=live_edge,
             )
 
             if signal_price >= take_profit:

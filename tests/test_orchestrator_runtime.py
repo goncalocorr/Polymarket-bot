@@ -43,6 +43,7 @@ async def test_start_rejects_non_positive_live_balance():
     orch = Orchestrator.__new__(Orchestrator)
     orch._running = False
     orch._tasks = []
+    orch._instance_lock = SimpleNamespace(acquire=MagicMock(return_value=True))
     orch.bot = SimpleNamespace(
         api_creds=SimpleNamespace(is_valid=lambda: True),
         get_balance=AsyncMock(return_value=0.0),
@@ -95,8 +96,36 @@ def test_status_writer_emits_valid_utc_timestamp():
     fromiso = datetime.fromisoformat(parsed)
     assert fromiso.tzinfo is not None
     assert not status["updated_at"].endswith("+00:00Z")
+    assert isinstance(status["process_id"], int)
     assert status["is_simulated"] is True
     assert status["pnl_mode"] == "simulated_mark_to_mid"
+    assert status["stop_reason"] == ""
+    assert status["resume_at"] == ""
+
+
+def test_status_writer_emits_pause_metadata():
+    order_manager = SimpleNamespace(
+        get_open_positions=MagicMock(return_value=[]),
+        ws=SimpleNamespace(get_mid_price=MagicMock(return_value=None)),
+    )
+    risk_manager = SimpleNamespace(
+        status="PAUSED",
+        stop_reason="Circuit breaker active",
+        resume_at="2026-04-02T09:00:00Z",
+        total_capital=500.0,
+    )
+    db = SimpleNamespace(
+        get_recent_trades=MagicMock(return_value=[]),
+        get_today_pnl=MagicMock(return_value=-12.5),
+        get_total_pnl=MagicMock(return_value=-12.5),
+    )
+    writer = StatusWriter(order_manager, risk_manager, db, strategies=[])
+
+    status = writer._build_status()
+
+    assert status["status"] == "PAUSED"
+    assert status["stop_reason"] == "Circuit breaker active"
+    assert status["resume_at"] == "2026-04-02T09:00:00Z"
 
 
 def test_status_writer_includes_close_reason_for_recent_trades():
@@ -165,6 +194,7 @@ async def test_start_restores_mispricing_runtime_state():
     orch._running = False
     orch._tasks = []
     orch._initial_capital = 500.0
+    orch._instance_lock = SimpleNamespace(acquire=MagicMock(return_value=True))
     orch.bot = SimpleNamespace(api_creds=None)
     orch.risk_manager = SimpleNamespace(
         total_capital=500.0,

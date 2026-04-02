@@ -203,6 +203,7 @@ class OrderManager:
     async def check_exits(self) -> list[Position]:
         """Check all open positions for take-profit / stop-loss conditions."""
         closed = []
+        now = datetime.now(timezone.utc)
 
         for pos in list(self.positions.values()):
             if not pos.is_open:
@@ -237,6 +238,18 @@ class OrderManager:
                     if p:
                         closed.append(p)
                     continue  # Don't fall through to position-stop check
+
+            # Mispricing positions should not sit indefinitely if the market
+            # never converges. Close them after a bounded holding window.
+            if (
+                pos.strategy == "mispricing"
+                and (now - pos.opened_at).total_seconds()
+                >= config.MISPRICING_MAX_HOLD_MIN * 60
+            ):
+                p = await self.close_position(pos.id, "time-stop")
+                if p:
+                    closed.append(p)
+                continue
 
             # Position-level stop: -20% of invested amount.
             # If the strategy provided an explicit stop, use that instead.

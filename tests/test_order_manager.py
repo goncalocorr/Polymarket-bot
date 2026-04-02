@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -95,3 +95,32 @@ async def test_check_exits_keeps_position_stop_as_fallback_without_strategy_stop
     await manager.check_exits()
 
     manager.close_position.assert_awaited_once_with("pos-1", "position-stop-20%")
+
+
+@pytest.mark.asyncio
+async def test_check_exits_time_stops_stale_mispricing_position():
+    manager = OrderManager(
+        bot=SimpleNamespace(),
+        ws=SimpleNamespace(get_mid_price=MagicMock(return_value=0.355)),
+        executor=SimpleNamespace(),
+    )
+    pos = Position(
+        id="pos-stale",
+        token_id="tok-1",
+        market_question="Test market",
+        strategy="mispricing",
+        side="BUY",
+        entry_price=0.355,
+        size_usdc=10.0,
+        take_profit=0.418,
+        stop_loss=0.313,
+        opened_at=datetime.now(timezone.utc),
+    )
+    pos.opened_at = pos.opened_at.replace(year=2025)
+    manager.positions[pos.id] = pos
+    manager.close_position = AsyncMock(return_value=pos)
+
+    with patch("config.MISPRICING_MAX_HOLD_MIN", 90):
+        await manager.check_exits()
+
+    manager.close_position.assert_awaited_once_with("pos-stale", "time-stop")

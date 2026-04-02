@@ -240,13 +240,23 @@ class TestMarketQuality:
 class TestMultiOutcomeArbitrage:
     """Test MultiOutcomeStrategy."""
 
-    def _make_strategy(self, events=None, event_markets=None):
+    def _make_strategy(
+        self,
+        events=None,
+        event_markets=None,
+        ws=None,
+        quality_scorer=None,
+    ):
         from strategies.multi_outcome import MultiOutcomeStrategy
 
         gamma = AsyncMock()
         gamma.get_arbitrage_events = AsyncMock(return_value=events or [])
         gamma.get_event_markets = AsyncMock(return_value=event_markets or [])
-        return MultiOutcomeStrategy(gamma)
+        return MultiOutcomeStrategy(
+            gamma,
+            ws=ws,
+            quality_scorer=quality_scorer,
+        )
 
     @pytest.mark.asyncio
     async def test_detects_pure_arbitrage(self):
@@ -408,6 +418,55 @@ class TestMultiOutcomeArbitrage:
         strategy.pause()
         signals = await strategy.evaluate()
         assert signals == []
+
+    @pytest.mark.asyncio
+    async def test_skips_arb_when_any_leg_has_low_market_quality(self):
+        events = [{
+            "id": "evt_low_quality",
+            "title": "Who wins?",
+            "markets": [
+                {
+                    "question": "Alice wins?",
+                    "outcomePrices": "0.30",
+                    "volume24hr": 10000,
+                    "tokens": [{"token_id": "tok_a", "outcome": "Yes"}],
+                },
+                {
+                    "question": "Bob wins?",
+                    "outcomePrices": "0.25",
+                    "volume24hr": 10000,
+                    "tokens": [{"token_id": "tok_b", "outcome": "Yes"}],
+                },
+                {
+                    "question": "Carol wins?",
+                    "outcomePrices": "0.20",
+                    "volume24hr": 10000,
+                    "tokens": [{"token_id": "tok_c", "outcome": "Yes"}],
+                },
+            ],
+        }]
+        ws = MagicMock()
+        ws.subscribe = AsyncMock()
+        ws.unsubscribe = AsyncMock()
+        ws.get_order_book.return_value = {"bids": [{"price": "0.3", "size": "100"}]}
+
+        quality = MagicMock()
+        quality.is_tradeable.side_effect = [
+            (True, "ok"),
+            (False, "too wide"),
+        ]
+
+        strategy = self._make_strategy(
+            events=events,
+            ws=ws,
+            quality_scorer=quality,
+        )
+
+        signals = await strategy.evaluate()
+
+        assert signals == []
+        assert ws.subscribe.await_count >= 1
+        quality.is_tradeable.assert_any_call("tok_a", volume_24h=10000.0)
 
 
 # ============================================================

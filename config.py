@@ -67,6 +67,7 @@ MIN_MISPRICING_PCT = float(os.getenv("MIN_MISPRICING_PCT", "0.08"))
 MISPRICING_REENTRY_COOLDOWN_MIN = int(
     os.getenv("MISPRICING_REENTRY_COOLDOWN_MIN", "30")
 )
+MISPRICING_MAX_HOLD_MIN = int(os.getenv("MISPRICING_MAX_HOLD_MIN", "90"))
 BLACKLISTED_CATEGORIES = [
     "us-politics",
     "celebrity",
@@ -108,6 +109,8 @@ PHASE2_TIMEOUT_S = 30
 PHASE3_INCREMENT_CENTS = 2.5
 PHASE3_TIMEOUT_S = 20
 MIN_ORDER_SIZE_USDC = 2.0
+DRY_RUN_SIMULATED_DELAY_MS = int(os.getenv("DRY_RUN_SIMULATED_DELAY_MS", "250"))
+DRY_RUN_SLIPPAGE_BPS = float(os.getenv("DRY_RUN_SLIPPAGE_BPS", "35"))
 
 # === Safety ===
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"

@@ -24,12 +24,16 @@ def executor(bot):
 class TestThreePhaseExecution:
     @pytest.mark.asyncio
     @patch("config.DRY_RUN", True)
-    async def test_dry_run_returns_immediately(self, executor, bot):
+    @patch("config.DRY_RUN_SIMULATED_DELAY_MS", 0)
+    @patch("config.DRY_RUN_SLIPPAGE_BPS", 35)
+    async def test_dry_run_applies_adverse_fill_slippage(self, executor, bot):
         bot.place_order.return_value = {"id": "dry-run-123", "status": "DRY_RUN"}
 
         result = await executor.execute("token1", 0.50, 10.0, "BUY")
         assert result.filled
         assert result.phases_used == 1
+        assert result.fill_price > 0.50
+        assert result.fill_size == 10.0
         bot.place_order.assert_called_once()
 
     @pytest.mark.asyncio

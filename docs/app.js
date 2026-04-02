@@ -26,6 +26,8 @@ const i18n = {
     exit: "Exit",
     time: "Time",
     simulationNote: "DRY RUN uses simulated mark-to-mid P&L. There are no real fills, slippage, or execution guarantees.",
+    statusReason: "Reason",
+    statusResume: "Resume",
     mode: { LIVE: "LIVE", DRY_RUN: "DRY RUN" },
     botStatus: { RUNNING: "Running", STOPPED: "Stopped", PAUSED: "Paused" },
     strategyStatus: { ACTIVE: "Active", PAUSED: "Paused", DISABLED: "Disabled" },
@@ -56,6 +58,8 @@ const i18n = {
     exit: "Saida",
     time: "Hora",
     simulationNote: "O DRY RUN usa P&L simulado por mark-to-mid. Nao ha fills reais, slippage real nem garantia de execucao.",
+    statusReason: "Motivo",
+    statusResume: "Retoma",
     mode: { LIVE: "REAL", DRY_RUN: "SIMULACAO" },
     botStatus: { RUNNING: "A correr", STOPPED: "Parado", PAUSED: "Em pausa" },
     strategyStatus: { ACTIVE: "Activo", PAUSED: "Em pausa", DISABLED: "Desactivado" },
@@ -258,6 +262,26 @@ function render() {
   } else {
     simulationNote.style.display = "none";
     simulationNote.textContent = "";
+  }
+
+  const statusNote = document.getElementById("status-note");
+  const stopReason = d.stop_reason || "";
+  const resumeAt = d.resume_at || "";
+  if (d.status === "PAUSED" || d.status === "STOPPED") {
+    const parts = [];
+    if (stopReason) parts.push(`${t("statusReason")}: ${stopReason}`);
+    if (resumeAt) {
+      const resumeDate = new Date(resumeAt);
+      const resumeText = isNaN(resumeDate.getTime()) ? resumeAt : resumeDate.toLocaleString();
+      parts.push(`${t("statusResume")}: ${resumeText}`);
+    }
+    statusNote.style.display = "block";
+    statusNote.className = "status-note " + d.status.toLowerCase();
+    statusNote.textContent = parts.join(" • ") || statusText;
+  } else {
+    statusNote.style.display = "none";
+    statusNote.className = "status-note";
+    statusNote.textContent = "";
   }
 
   document.getElementById("capital-label").textContent = t("capital");

@@ -284,6 +284,27 @@ header {
   line-height: 1.5;
 }
 
+.status-note {
+  margin: -8px 0 24px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.status-note.paused {
+  background: linear-gradient(135deg, rgba(251, 191, 36, 0.12), rgba(129, 140, 248, 0.06));
+  border-color: rgba(251, 191, 36, 0.18);
+  color: #fde68a;
+}
+
+.status-note.stopped {
+  background: linear-gradient(135deg, rgba(248, 113, 113, 0.12), rgba(251, 191, 36, 0.06));
+  border-color: rgba(248, 113, 113, 0.18);
+  color: #fecaca;
+}
+
 .positive { color: var(--green); }
 .negative { color: var(--red); }
 .neutral { color: var(--text-secondary); }

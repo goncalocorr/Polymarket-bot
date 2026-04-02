@@ -18,6 +18,8 @@ from loguru import logger
 
 import config
 from core.gamma_client import GammaClient
+from core.websocket_client import MarketWebSocket
+from data.market_quality import MarketQualityScorer
 from strategies.base import BaseStrategy, Signal
 from strategies.mispricing import _normalise_tokens, _parse_outcome_price
 
@@ -35,24 +37,69 @@ class MultiOutcomeStrategy(BaseStrategy):
     def __init__(
         self,
         gamma: GammaClient,
+        ws: MarketWebSocket | None = None,
+        quality_scorer: MarketQualityScorer | None = None,
         max_sum: float = config.ARBITRAGE_MAX_SUM,
         min_outcomes: int = config.ARBITRAGE_MIN_OUTCOMES,
         size_usdc: float = config.ARBITRAGE_SIZE_USDC,
     ):
         super().__init__("multi_outcome_arb")
         self.gamma = gamma
+        self.ws = ws
+        self.quality = quality_scorer
         self.max_sum = max_sum
         self.min_outcomes = min_outcomes
         self.size_usdc = size_usdc
         # Track events we've already arbed to avoid duplicates.
         # OrderedDict preserves insertion order so pruning keeps the most recent.
         self._arbed_events: OrderedDict[str, bool] = OrderedDict()
+        self._subscribed_tokens: set[str] = set()
 
     async def initialize(self):
         logger.info(
             f"MultiOutcome: Initialized (max_sum={self.max_sum}, "
             f"min_outcomes={self.min_outcomes})"
         )
+
+    async def _ensure_market_data_ready(self, token_id: str) -> bool:
+        if not self.ws:
+            return True
+
+        if token_id not in self._subscribed_tokens:
+            await self.ws.subscribe(token_id)
+            self._subscribed_tokens.add(token_id)
+
+        return self.ws.get_order_book(token_id) is not None
+
+    async def _event_is_tradeable(
+        self,
+        event_title: str,
+        outcome_data: list[dict],
+    ) -> bool:
+        if not self.quality:
+            return True
+
+        for outcome in outcome_data:
+            token_id = outcome["token_id"]
+            if not await self._ensure_market_data_ready(token_id):
+                logger.debug(
+                    f"MultiOutcome: Waiting for order book on '{event_title[:40]}...' "
+                    f"({outcome['question'][:30]}...) before quality check"
+                )
+                return False
+
+            tradeable, report = self.quality.is_tradeable(
+                token_id,
+                volume_24h=outcome.get("volume_24h", 0.0),
+            )
+            if not tradeable:
+                logger.debug(
+                    f"MultiOutcome: Skipping '{event_title[:40]}...' - "
+                    f"low quality on '{outcome['question'][:30]}...': {report}"
+                )
+                return False
+
+        return True
 
     async def evaluate(self) -> list[Signal]:
         """Scan for multi-outcome arbitrage opportunities."""
@@ -90,6 +137,9 @@ class MultiOutcomeStrategy(BaseStrategy):
             price_sum = sum(o["price"] for o in outcome_data)
 
             if price_sum <= 0 or price_sum >= self.max_sum:
+                continue
+
+            if not await self._event_is_tradeable(event_title, outcome_data):
                 continue
 
             # We have an arbitrage opportunity!
@@ -201,11 +251,16 @@ class MultiOutcomeStrategy(BaseStrategy):
                     "token_id": token_id,
                     "price": price,
                     "question": question,
+                    "volume_24h": float(m.get("volume24hr", 0) or 0),
                 })
 
         return outcomes
 
     async def shutdown(self):
+        if self.ws:
+            for token_id in list(self._subscribed_tokens):
+                await self.ws.unsubscribe(token_id)
+        self._subscribed_tokens.clear()
         n = len(self._arbed_events)
         self._arbed_events.clear()
         logger.info(f"MultiOutcome: Shut down ({n} events arbed)")

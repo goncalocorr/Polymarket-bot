@@ -26,7 +26,10 @@ env/
 # Data
 data/*.db
 data/*.parquet
+data/archive/
+data/*.lock
 docs/data/runtime_status.json
+docs/data/runtime_status_*.json
 logs/
 *.log
 tmp_test/

@@ -295,3 +295,19 @@ class RiskManager:
         if self._circuit_breaker_until and datetime.now(timezone.utc) < self._circuit_breaker_until:
             return "PAUSED"
         return "RUNNING"
+
+    @property
+    def stop_reason(self) -> str:
+        """Human-readable reason for the current non-running status."""
+        if self._daily_stop_triggered:
+            return "Daily stop-loss triggered"
+        if self._circuit_breaker_until and datetime.now(timezone.utc) < self._circuit_breaker_until:
+            return "Circuit breaker active"
+        return ""
+
+    @property
+    def resume_at(self) -> str:
+        """UTC resume timestamp when a temporary pause is active."""
+        if self._circuit_breaker_until and datetime.now(timezone.utc) < self._circuit_breaker_until:
+            return self._circuit_breaker_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return ""

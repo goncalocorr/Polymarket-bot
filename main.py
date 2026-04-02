@@ -4,6 +4,7 @@ Runs 24/7, coordinating strategies, execution, risk management, and monitoring.
 """
 
 import asyncio
+import os
 import signal
 import sys
 import traceback
@@ -42,13 +43,16 @@ VERSION = "1.0.0"
 # --- Logging ---
 logger.remove()
 logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
-logger.add(
-    str(config.LOGS_DIR / "bot_{time:YYYY-MM-DD}.log"),
-    rotation="1 day",
-    retention="30 days",
-    level="DEBUG",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {module}:{line} | {message}",
-)
+if "PYTEST_CURRENT_TEST" not in os.environ and not any(
+    "pytest" in arg.lower() for arg in sys.argv
+):
+    logger.add(
+        str(config.LOGS_DIR / "bot_{time:YYYY-MM-DD}.log"),
+        rotation="1 day",
+        retention="30 days",
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {module}:{line} | {message}",
+    )
 
 
 class Orchestrator:
@@ -85,9 +89,13 @@ class Orchestrator:
             ws=self.ws, quality_scorer=self.quality_scorer,
         )
         self.ai_agent = AIAgentStrategy(
-            self.gamma, self.external, self.analyst
+            self.gamma, self.external, self.analyst, db=self.db
         )
-        self.multi_outcome = MultiOutcomeStrategy(self.gamma)
+        self.multi_outcome = MultiOutcomeStrategy(
+            self.gamma,
+            ws=self.ws,
+            quality_scorer=self.quality_scorer,
+        )
         self.strategies = [
             self.flash_crash, self.mispricing,
             self.ai_agent, self.multi_outcome,

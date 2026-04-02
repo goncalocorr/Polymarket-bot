@@ -4,6 +4,7 @@ Terminal TUI dashboard (using rich) and status.json writer for the web dashboard
 
 import json
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from rich.console import Console
@@ -47,9 +48,12 @@ class StatusWriter:
         return {
             "updated_at": updated_at,
             "mode": "DRY_RUN" if config.DRY_RUN else "LIVE",
+            "process_id": os.getpid(),
             "is_simulated": config.DRY_RUN,
             "pnl_mode": "simulated_mark_to_mid" if config.DRY_RUN else "realized",
             "status": self.risk_manager.status,
+            "stop_reason": getattr(self.risk_manager, "stop_reason", "") or "",
+            "resume_at": getattr(self.risk_manager, "resume_at", "") or "",
             "capital_usdc": round(self.risk_manager.total_capital, 2),
             "pnl_today_usdc": round(pnl_today, 2),
             "pnl_today_pct": round(
