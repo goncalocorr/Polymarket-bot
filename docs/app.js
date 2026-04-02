@@ -5,11 +5,14 @@ const i18n = {
     capital: "Total Capital",
     todayPnl: "Today's P&L",
     totalPnl: "Total P&L",
+    simulatedTodayPnl: "Simulated P&L Today",
+    simulatedTotalPnl: "Simulated Total P&L",
     exposure: "Exposure",
     openPositions: "Open Positions",
     recentTrades: "Recent Trades",
     strategies: "Strategies",
     recentPnl: "Recent P&L",
+    recentPnlSim: "Recent Simulated P&L",
     noPositions: "No open positions",
     noTrades: "No closed trades yet",
     lastUpdated: "Updated",
@@ -19,8 +22,10 @@ const i18n = {
     current: "Current",
     size: "Size",
     pnl: "P&L",
+    unrealisedPnlSim: "Unrealised P&L (Est.)",
     exit: "Exit",
     time: "Time",
+    simulationNote: "DRY RUN uses simulated mark-to-mid P&L. There are no real fills, slippage, or execution guarantees.",
     mode: { LIVE: "LIVE", DRY_RUN: "DRY RUN" },
     botStatus: { RUNNING: "Running", STOPPED: "Stopped", PAUSED: "Paused" },
     strategyStatus: { ACTIVE: "Active", PAUSED: "Paused", DISABLED: "Disabled" },
@@ -30,11 +35,14 @@ const i18n = {
     capital: "Capital Total",
     todayPnl: "P&L Hoje",
     totalPnl: "P&L Total",
+    simulatedTodayPnl: "P&L Simulado Hoje",
+    simulatedTotalPnl: "P&L Simulado Total",
     exposure: "Exposicao",
     openPositions: "Posicoes Abertas",
     recentTrades: "Trades Recentes",
     strategies: "Estrategias",
     recentPnl: "P&L Recente",
+    recentPnlSim: "P&L Simulado Recente",
     noPositions: "Sem posicoes abertas",
     noTrades: "Sem trades fechados",
     lastUpdated: "Actualizado",
@@ -44,8 +52,10 @@ const i18n = {
     current: "Actual",
     size: "Tamanho",
     pnl: "P&L",
+    unrealisedPnlSim: "P&L Nao Realizado (Estim.)",
     exit: "Saida",
     time: "Hora",
+    simulationNote: "O DRY RUN usa P&L simulado por mark-to-mid. Nao ha fills reais, slippage real nem garantia de execucao.",
     mode: { LIVE: "REAL", DRY_RUN: "SIMULACAO" },
     botStatus: { RUNNING: "A correr", STOPPED: "Parado", PAUSED: "Em pausa" },
     strategyStatus: { ACTIVE: "Activo", PAUSED: "Em pausa", DISABLED: "Desactivado" },
@@ -68,17 +78,21 @@ function setLang(lang) {
 
 // ===== Fetch =====
 async function fetchStatus() {
-  try {
-    const r = await fetch("data/status.json?t=" + Date.now());
-    if (!r.ok) return;
-    statusData = await r.json();
-    render();
-  } catch (e) { /* retry next interval */ }
+  const paths = ["data/runtime_status.json", "data/status.json"];
+  for (const path of paths) {
+    try {
+      const r = await fetch(path + "?t=" + Date.now());
+      if (!r.ok) continue;
+      statusData = await r.json();
+      render();
+      return;
+    } catch (e) { /* try next path */ }
+  }
 }
 
 // ===== Helpers =====
 function escHtml(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 function pnlClass(v) { return v > 0 ? "positive" : v < 0 ? "negative" : "neutral"; }
 function fmtUsd(v) { return (v >= 0 ? "+$" : "-$") + Math.abs(v).toFixed(2); }
@@ -126,7 +140,6 @@ function drawPnlChart(trades) {
     return;
   }
 
-  // Build cumulative P&L
   const pnls = trades.slice().reverse().map(t => t.pnl_usdc || 0);
   const cumulative = [];
   let sum = 0;
@@ -140,7 +153,6 @@ function drawPnlChart(trades) {
   const toY = v => pad.t + plotH - ((v - min) / range) * plotH;
   const toX = i => pad.l + i * xStep;
 
-  // Grid lines
   ctx.strokeStyle = "#1f1f23";
   ctx.lineWidth = 1;
   for (let i = 0; i <= 4; i++) {
@@ -151,7 +163,6 @@ function drawPnlChart(trades) {
     ctx.stroke();
   }
 
-  // Zero line
   const zeroY = toY(0);
   ctx.strokeStyle = "#27272a";
   ctx.lineWidth = 1;
@@ -162,7 +173,6 @@ function drawPnlChart(trades) {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Area gradient
   const lastVal = cumulative[cumulative.length - 1];
   const isPositive = lastVal >= 0;
   const color = isPositive ? "52, 211, 153" : "248, 113, 113";
@@ -181,7 +191,6 @@ function drawPnlChart(trades) {
   ctx.fillStyle = gradient;
   ctx.fill();
 
-  // Line
   ctx.beginPath();
   ctx.moveTo(toX(0), toY(cumulative[0]));
   for (let i = 1; i < cumulative.length; i++) {
@@ -192,7 +201,6 @@ function drawPnlChart(trades) {
   ctx.lineJoin = "round";
   ctx.stroke();
 
-  // End dot
   const lastX = toX(cumulative.length - 1);
   const lastY = toY(lastVal);
   ctx.beginPath();
@@ -205,7 +213,6 @@ function drawPnlChart(trades) {
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  // Y-axis labels
   ctx.fillStyle = "#71717a";
   ctx.font = "10px 'JetBrains Mono', monospace";
   ctx.textAlign = "right";
@@ -215,7 +222,6 @@ function drawPnlChart(trades) {
     ctx.fillText("$" + val.toFixed(1), pad.l - 8, y + 3);
   }
 
-  // X-axis labels
   ctx.textAlign = "center";
   const labelInterval = Math.max(1, Math.floor(cumulative.length / 5));
   for (let i = 0; i < cumulative.length; i += labelInterval) {
@@ -229,7 +235,6 @@ function render() {
   const d = statusData;
   const l = i18n[currentLang];
 
-  // Header
   document.getElementById("page-title").textContent = t("title");
 
   const statusBadge = document.getElementById("status-badge");
@@ -242,38 +247,45 @@ function render() {
   modeBadge.className = "badge " + (d.mode === "LIVE" ? "badge-live" : "badge-dry-run");
 
   const updated = new Date(d.updated_at);
-  const timeStr = isNaN(updated.getTime()) ? "—" : updated.toLocaleTimeString();
+  const timeStr = isNaN(updated.getTime()) ? "--" : updated.toLocaleTimeString();
   document.getElementById("last-updated").textContent =
     t("lastUpdated") + " " + timeStr;
 
-  // Metrics
+  const simulationNote = document.getElementById("simulation-note");
+  if (d.is_simulated) {
+    simulationNote.style.display = "block";
+    simulationNote.textContent = t("simulationNote");
+  } else {
+    simulationNote.style.display = "none";
+    simulationNote.textContent = "";
+  }
+
   document.getElementById("capital-label").textContent = t("capital");
   document.getElementById("capital-value").textContent = "$" + d.capital_usdc.toFixed(2);
 
-  document.getElementById("today-pnl-label").textContent = t("todayPnl");
+  document.getElementById("today-pnl-label").textContent =
+    d.is_simulated ? t("simulatedTodayPnl") : t("todayPnl");
   const todayEl = document.getElementById("today-pnl-value");
   todayEl.textContent = fmtUsd(d.pnl_today_usdc);
   todayEl.className = "metric-value " + pnlClass(d.pnl_today_usdc);
   document.getElementById("today-pnl-pct").textContent = fmtPct(d.pnl_today_pct);
   document.getElementById("today-pnl-pct").className = "metric-sub " + pnlClass(d.pnl_today_pct);
 
-  document.getElementById("total-pnl-label").textContent = t("totalPnl");
+  document.getElementById("total-pnl-label").textContent =
+    d.is_simulated ? t("simulatedTotalPnl") : t("totalPnl");
   const totalEl = document.getElementById("total-pnl-value");
   totalEl.textContent = fmtUsd(d.pnl_total_usdc);
   totalEl.className = "metric-value " + pnlClass(d.pnl_total_usdc);
 
-  // Null-safe arrays
-  const positions = positions || [];
-  const trades = trades || [];
+  const positions = d.open_positions || [];
+  const trades = d.recent_trades || [];
 
-  // Exposure
   document.getElementById("exposure-label").textContent = t("exposure");
   const totalExposure = positions.reduce((s, p) => s + p.size_usdc, 0);
   document.getElementById("exposure-value").textContent = "$" + totalExposure.toFixed(2);
   const expPct = d.capital_usdc > 0 ? (totalExposure / d.capital_usdc) * 100 : 0;
   document.getElementById("exposure-pct").textContent = expPct.toFixed(1) + "% of capital";
 
-  // Strategies
   document.getElementById("strategies-title").textContent = t("strategies");
   const stratList = document.getElementById("strategies-list");
   const strats = Object.entries(d.strategies || {});
@@ -290,11 +302,10 @@ function render() {
     </div>`;
   }).join("");
 
-  // Chart
-  document.getElementById("chart-title").textContent = t("recentPnl");
+  document.getElementById("chart-title").textContent =
+    d.is_simulated ? t("recentPnlSim") : t("recentPnl");
   drawPnlChart(trades);
 
-  // Positions
   document.getElementById("positions-title").textContent = t("openPositions");
   document.getElementById("positions-count").textContent = positions.length;
   document.getElementById("th-market").textContent = t("market");
@@ -302,7 +313,8 @@ function render() {
   document.getElementById("th-entry").textContent = t("entry");
   document.getElementById("th-current").textContent = t("current");
   document.getElementById("th-size").textContent = t("size");
-  document.getElementById("th-pnl").textContent = t("pnl");
+  document.getElementById("th-pnl").textContent =
+    d.is_simulated ? t("unrealisedPnlSim") : t("pnl");
 
   const posTable = document.getElementById("positions-table");
   const posEmpty = document.getElementById("positions-empty");
@@ -325,7 +337,6 @@ function render() {
     </tr>`).join("");
   }
 
-  // Trades
   document.getElementById("trades-title").textContent = t("recentTrades");
   document.getElementById("trades-count").textContent = trades.length;
   document.getElementById("th-t-market").textContent = t("market");

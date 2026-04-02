@@ -11,7 +11,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
 DOCS_DIR = BASE_DIR / "docs"
-STATUS_JSON_PATH = DOCS_DIR / "data" / "status.json"
+STATUS_JSON_PATH = DOCS_DIR / "data" / "runtime_status.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
@@ -23,6 +23,11 @@ POLY_SAFE_ADDRESS = os.getenv("POLY_SAFE_ADDRESS", "")
 POLY_BUILDER_API_KEY = os.getenv("POLY_BUILDER_API_KEY", "")
 POLY_BUILDER_API_SECRET = os.getenv("POLY_BUILDER_API_SECRET", "")
 POLY_BUILDER_API_PASSPHRASE = os.getenv("POLY_BUILDER_API_PASSPHRASE", "")
+
+# L2 API credentials (derived from EIP-712 auth, or supplied directly)
+POLY_API_KEY = os.getenv("POLY_API_KEY", "")
+POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
+POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
 POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
 
 POLYMARKET_CLOB_URL = "https://clob.polymarket.com"
@@ -40,9 +45,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # === External data ===
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
+KALSHI_API_KEY = os.getenv("KALSHI_API_KEY", "")
+KALSHI_API_SECRET = os.getenv("KALSHI_API_SECRET", "")
 KALSHI_API_URL = "https://trading-api.kalshi.com/trade-api/v2/markets"
 METACULUS_API_URL = "https://www.metaculus.com/api2/questions/"
-MANIFOLD_API_URL = "https://api.manifold.markets/v0/markets"
+MANIFOLD_API_URL = "https://api.manifold.markets/v0/search-markets"
 
 # === Flash Crash Strategy ===
 FLASH_CRASH_SIZE_USDC = float(os.getenv("FLASH_CRASH_SIZE_USDC", "5.0"))
@@ -57,6 +64,9 @@ MAX_SPREAD_CENTS = float(os.getenv("MAX_SPREAD_CENTS", "3"))
 MIN_DAYS_TO_RESOLUTION = int(os.getenv("MIN_DAYS_TO_RESOLUTION", "3"))
 MAX_DAYS_TO_RESOLUTION = int(os.getenv("MAX_DAYS_TO_RESOLUTION", "60"))
 MIN_MISPRICING_PCT = float(os.getenv("MIN_MISPRICING_PCT", "0.08"))
+MISPRICING_REENTRY_COOLDOWN_MIN = int(
+    os.getenv("MISPRICING_REENTRY_COOLDOWN_MIN", "30")
+)
 BLACKLISTED_CATEGORIES = [
     "us-politics",
     "celebrity",
@@ -69,6 +79,27 @@ MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.10"))
 MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.60"))
 CIRCUIT_BREAKER_CONSECUTIVE_LOSSES = int(os.getenv("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES", "3"))
 CIRCUIT_BREAKER_PAUSE_HOURS = int(os.getenv("CIRCUIT_BREAKER_PAUSE_HOURS", "2"))
+
+# === Kelly Criterion Sizing ===
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.50"))  # Half-Kelly
+MIN_KELLY_EDGE = float(os.getenv("MIN_KELLY_EDGE", "0.03"))  # Min 3% edge to trade
+KELLY_MIN_CONFIDENCE = float(os.getenv("KELLY_MIN_CONFIDENCE", "0.50"))
+
+# === Market Quality ===
+MIN_MARKET_QUALITY_SCORE = float(os.getenv("MIN_MARKET_QUALITY_SCORE", "0.40"))
+MIN_DEPTH_USDC = float(os.getenv("MIN_DEPTH_USDC", "100.0"))
+
+# === Multi-Outcome Arbitrage ===
+ARBITRAGE_MAX_SUM = float(os.getenv("ARBITRAGE_MAX_SUM", "0.97"))  # Sum < this = pure arb
+ARBITRAGE_MIN_OUTCOMES = int(os.getenv("ARBITRAGE_MIN_OUTCOMES", "3"))
+ARBITRAGE_SIZE_USDC = float(os.getenv("ARBITRAGE_SIZE_USDC", "10.0"))
+
+# === Strategy Tracker ===
+TRACKER_ROLLING_WINDOW = int(os.getenv("TRACKER_ROLLING_WINDOW", "20"))
+TRACKER_AUTO_PAUSE_WIN_RATE = float(os.getenv("TRACKER_AUTO_PAUSE_WIN_RATE", "0.35"))
+TRACKER_AUTO_PAUSE_HOURS = int(os.getenv("TRACKER_AUTO_PAUSE_HOURS", "4"))
+TRACKER_BOOST_WIN_RATE = float(os.getenv("TRACKER_BOOST_WIN_RATE", "0.65"))
+TRACKER_BOOST_FACTOR = float(os.getenv("TRACKER_BOOST_FACTOR", "1.50"))
 
 # === Three-Phase Execution ===
 PHASE1_TIMEOUT_S = 45

@@ -3,11 +3,9 @@ Market scanner — periodically scans for trading opportunities across strategie
 """
 
 import asyncio
-from datetime import datetime, timezone
 
 from loguru import logger
 
-from core.gamma_client import GammaClient
 from strategies.base import BaseStrategy, Signal
 
 

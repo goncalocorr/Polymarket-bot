@@ -5,7 +5,6 @@ Terminal TUI dashboard (using rich) and status.json writer for the web dashboard
 import json
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional
 
 from rich.console import Console
 from rich.layout import Layout
@@ -16,7 +15,7 @@ from rich.text import Text
 from loguru import logger
 
 import config
-from execution.order_manager import OrderManager, Position
+from execution.order_manager import OrderManager
 from risk.risk_manager import RiskManager
 from storage.database import Database
 from strategies.base import BaseStrategy
@@ -36,16 +35,20 @@ class StatusWriter:
         self.risk_manager = risk_manager
         self.db = db
         self.strategies = strategies
+        self._running = False
 
     def _build_status(self) -> dict:
         now = datetime.now(timezone.utc)
         open_positions = self.order_manager.get_open_positions()
         recent_trades = self.db.get_recent_trades(10)
         pnl_today = self.db.get_today_pnl()
+        updated_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
         return {
-            "updated_at": now.isoformat() + "Z",
+            "updated_at": updated_at,
             "mode": "DRY_RUN" if config.DRY_RUN else "LIVE",
+            "is_simulated": config.DRY_RUN,
+            "pnl_mode": "simulated_mark_to_mid" if config.DRY_RUN else "realized",
             "status": self.risk_manager.status,
             "capital_usdc": round(self.risk_manager.total_capital, 2),
             "pnl_today_usdc": round(pnl_today, 2),
@@ -80,6 +83,7 @@ class StatusWriter:
                     "entry_price": t.get("entry_price", 0),
                     "exit_price": t.get("exit_price", 0),
                     "pnl_usdc": round(t.get("pnl_usdc", 0), 2),
+                    "close_reason": t.get("close_reason", ""),
                     "closed_at": t.get("closed_at", ""),
                 }
                 for t in recent_trades
@@ -102,9 +106,13 @@ class StatusWriter:
 
     async def run(self, interval_s: float = config.STATUS_UPDATE_INTERVAL_S):
         """Periodically write status.json."""
-        while True:
+        self._running = True
+        while self._running:
             await self.write_status()
             await asyncio.sleep(interval_s)
+
+    def stop(self):
+        self._running = False
 
 
 class TerminalDashboard:
@@ -144,6 +152,8 @@ class TerminalDashboard:
         day_pnl = self.db.get_today_pnl()
         total_pnl = self.db.get_total_pnl()
         day_pct = (day_pnl / max(capital, 1)) * 100  # single query, reused below
+        today_label = "Simulated P&L Today" if config.DRY_RUN else "Today P&L"
+        total_label = "Simulated Total P&L" if config.DRY_RUN else "Total P&L"
 
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column("Label", style="dim")
@@ -153,13 +163,13 @@ class TerminalDashboard:
 
         pnl_style = "green" if day_pnl >= 0 else "red"
         table.add_row(
-            "Today P&L",
+            today_label,
             Text(f"${day_pnl:+.2f} ({day_pct:+.1f}%)", style=pnl_style),
         )
 
         total_style = "green" if total_pnl >= 0 else "red"
         table.add_row(
-            "Total P&L",
+            total_label,
             Text(f"${total_pnl:+.2f}", style=total_style),
         )
 
@@ -176,7 +186,11 @@ class TerminalDashboard:
         table.add_column("Side", width=4)
         table.add_column("Entry", justify="right", width=7)
         table.add_column("Current", justify="right", width=7)
-        table.add_column("P&L", justify="right", width=10)
+        table.add_column(
+            "Unrealised P&L*" if config.DRY_RUN else "P&L",
+            justify="right",
+            width=14,
+        )
 
         if not positions:
             table.add_row("No open positions", "", "", "", "")
@@ -251,7 +265,11 @@ class TerminalDashboard:
 
     async def run(self, refresh_rate: float = 2.0):
         """Run the live terminal dashboard."""
+        self._running = True
         with Live(console=self.console, refresh_per_second=1 / refresh_rate) as live:
-            while True:
+            while self._running:
                 live.update(self.render())
                 await asyncio.sleep(refresh_rate)
+
+    def stop(self):
+        self._running = False

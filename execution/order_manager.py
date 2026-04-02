@@ -2,8 +2,9 @@
 Order lifecycle management — tracks open positions and manages exits.
 """
 
-import asyncio
+import uuid
 from dataclasses import dataclass, field
+from dateutil.parser import isoparse
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -12,7 +13,7 @@ from loguru import logger
 import config
 from core.bot import TradingBot
 from core.websocket_client import MarketWebSocket
-from execution.executor import ThreePhaseExecutor, ExecutionResult
+from execution.executor import ThreePhaseExecutor
 
 
 @dataclass
@@ -31,8 +32,9 @@ class Position:
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     closed_at: Optional[datetime] = None
     exit_price: Optional[float] = None
+    close_reason: str = ""
     pnl_usdc: float = 0.0
-    status: str = "OPEN"  # OPEN, CLOSED, STOPPED
+    status: str = "OPEN"  # OPEN, CLOSING, CLOSED, STOPPED
 
     @property
     def is_open(self) -> bool:
@@ -41,10 +43,15 @@ class Position:
     def current_pnl(self, current_price: float) -> float:
         """Calculate unrealised P&L at a given price."""
         if self.side == "BUY":
+            if self.entry_price <= 0:
+                return 0.0
             shares = self.size_usdc / self.entry_price
             return shares * (current_price - self.entry_price)
         else:
-            shares = self.size_usdc / (1 - self.entry_price)
+            denom = 1 - self.entry_price
+            if denom <= 0:
+                return 0.0
+            shares = self.size_usdc / denom
             return shares * (self.entry_price - current_price)
 
 
@@ -66,11 +73,41 @@ class OrderManager:
         self.ws = ws
         self.executor = executor
         self.positions: dict[str, Position] = {}  # id -> Position
-        self._position_counter = 0
+
+    def load_open_positions(self, open_trades: list[dict]):
+        """Restore open positions from database rows after a restart."""
+        for t in open_trades:
+            pos = Position(
+                id=t["id"],
+                token_id=t["token_id"],
+                market_question=t.get("market_question", ""),
+                strategy=t["strategy"],
+                side=t["side"],
+                entry_price=t["entry_price"],
+                size_usdc=t["size_usdc"],
+                take_profit=(
+                    float(t["take_profit"])
+                    if t.get("take_profit") is not None
+                    else None
+                ),
+                stop_loss=(
+                    float(t["stop_loss"])
+                    if t.get("stop_loss") is not None
+                    else None
+                ),
+                opened_at=(
+                    isoparse(t["opened_at"])
+                    if isinstance(t.get("opened_at"), str)
+                    else datetime.now(timezone.utc)
+                ),
+                close_reason=t.get("close_reason", "") or "",
+            )
+            self.positions[pos.id] = pos
+        if open_trades:
+            logger.info(f"Restored {len(open_trades)} open positions from database")
 
     def _next_id(self) -> str:
-        self._position_counter += 1
-        return f"pos-{self._position_counter:04d}"
+        return f"pos-{uuid.uuid4().hex[:12]}"
 
     async def open_position(
         self,
@@ -120,6 +157,9 @@ class OrderManager:
         if not pos or not pos.is_open:
             return None
 
+        # Prevent re-entry: mark as CLOSING before any async work
+        pos.status = "CLOSING"
+
         current_price = self.ws.get_mid_price(pos.token_id)
         if current_price is None:
             current_price = pos.entry_price
@@ -135,6 +175,7 @@ class OrderManager:
                 f"Exit FAILED for {pos.id} ({reason or 'manual'}) — "
                 f"position remains OPEN. Error: {result.error}"
             )
+            pos.status = "OPEN"  # Revert from CLOSING
             return None
 
         # Partial exit: reduce position size, keep OPEN for remainder
@@ -144,9 +185,11 @@ class OrderManager:
                 f"position remains OPEN for remainder"
             )
             pos.size_usdc -= result.fill_size
+            pos.status = "OPEN"  # Revert from CLOSING
             return None
 
         pos.exit_price = result.fill_price if result.filled else current_price
+        pos.close_reason = reason or "manual"
         pos.pnl_usdc = pos.current_pnl(pos.exit_price)
         pos.closed_at = datetime.now(timezone.utc)
         pos.status = "CLOSED"
@@ -171,25 +214,50 @@ class OrderManager:
 
             unrealised = pos.current_pnl(current_price)
 
-            # Take profit check
-            if pos.take_profit is not None and current_price >= pos.take_profit:
-                p = await self.close_position(pos.id, "take-profit")
-                if p:
-                    closed.append(p)
-                continue
+            # Take profit check (direction depends on side)
+            if pos.take_profit is not None:
+                tp_hit = (
+                    current_price >= pos.take_profit if pos.side == "BUY"
+                    else current_price <= pos.take_profit
+                )
+                if tp_hit:
+                    p = await self.close_position(pos.id, "take-profit")
+                    if p:
+                        closed.append(p)
+                    continue
 
-            # Stop loss check
-            if pos.stop_loss is not None and current_price <= pos.stop_loss:
-                p = await self.close_position(pos.id, "stop-loss")
-                if p:
-                    closed.append(p)
-                continue  # Don't fall through to position-stop check
+            # Stop loss check (direction depends on side)
+            if pos.stop_loss is not None:
+                sl_hit = (
+                    current_price <= pos.stop_loss if pos.side == "BUY"
+                    else current_price >= pos.stop_loss
+                )
+                if sl_hit:
+                    p = await self.close_position(pos.id, "stop-loss")
+                    if p:
+                        closed.append(p)
+                    continue  # Don't fall through to position-stop check
 
-            # Position-level stop: -20% of invested amount
-            if unrealised <= -(pos.size_usdc * 0.20):
+            # Position-level stop: -20% of invested amount.
+            # If the strategy provided an explicit stop, use that instead.
+            if pos.stop_loss is None and unrealised <= -(pos.size_usdc * 0.20):
                 p = await self.close_position(pos.id, "position-stop-20%")
                 if p:
                     closed.append(p)
+
+        # Prune closed positions to prevent unbounded memory growth
+        closed_ids = [
+            pid for pid, p in self.positions.items()
+            if p.status in ("CLOSED", "STOPPED")
+        ]
+        if len(closed_ids) > 100:
+            # Sort by closed_at, remove oldest
+            closed_positions = sorted(
+                [(pid, self.positions[pid]) for pid in closed_ids],
+                key=lambda x: x[1].closed_at or datetime.min.replace(tzinfo=timezone.utc),
+            )
+            for pid, _ in closed_positions[:-50]:  # Keep last 50
+                del self.positions[pid]
 
         return closed
 

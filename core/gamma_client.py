@@ -80,6 +80,46 @@ class GammaClient:
             logger.error(f"Gamma API error fetching events: {e}")
             return []
 
+    async def get_event_markets(self, event_id: str) -> list[dict]:
+        """Fetch all markets belonging to a specific event."""
+        client = await self._get_client()
+        try:
+            resp = await client.get(
+                "/markets",
+                params={"event_id": event_id, "active": "true", "limit": 50},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPError as e:
+            logger.error(f"Gamma API error fetching event {event_id} markets: {e}")
+            return []
+
+    async def get_arbitrage_events(self, min_outcomes: int = 3) -> list[dict]:
+        """
+        Find multi-outcome events suitable for arbitrage scanning.
+        Returns events that have at least `min_outcomes` active markets.
+        """
+        events = await self.get_events(limit=100)
+        candidates = []
+
+        for event in events:
+            # Check if event has enough markets
+            market_count = event.get("market_count", 0) or len(
+                event.get("markets", [])
+            )
+            if market_count >= min_outcomes:
+                candidates.append(event)
+
+            # Rate limit
+            if len(candidates) >= 20:
+                break
+
+        logger.info(
+            f"Found {len(candidates)} multi-outcome events "
+            f"(≥{min_outcomes} outcomes) from {len(events)} total"
+        )
+        return candidates
+
     async def get_15min_crypto_markets(self) -> list[dict]:
         """
         Find active 15-minute Up/Down markets for crypto (BTC/ETH/SOL/XRP).
@@ -119,14 +159,19 @@ class GammaClient:
         """
         all_markets = []
         offset = 0
-        while True:
+        max_pages = 10  # Safety cap to avoid runaway pagination
+        page = 0
+        while page < max_pages:
             batch = await self.get_markets(active=True, limit=100, offset=offset)
             if not batch:
                 break
             all_markets.extend(batch)
             offset += len(batch)
+            page += 1
             if len(batch) < 100:
                 break
+            # Rate-limit: don't hammer the API
+            await asyncio.sleep(0.5)
 
         filtered = []
         now = datetime.now(timezone.utc)

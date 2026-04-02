@@ -25,6 +25,9 @@ class Signal:
     size_usdc: float
     take_profit: Optional[float] = None
     stop_loss: Optional[float] = None
+    arb_group_id: Optional[str] = None  # For atomic multi-leg execution
+    arb_event_id: Optional[str] = None  # For post-fill arbitrage de-duplication
+    estimated_prob: Optional[float] = None
     confidence: float = 0.0
     reasoning: str = ""
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

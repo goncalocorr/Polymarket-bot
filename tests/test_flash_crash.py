@@ -14,6 +14,7 @@ def ws():
     ws = MagicMock(spec=MarketWebSocket)
     ws.subscribe = AsyncMock()
     ws.unsubscribe = AsyncMock()
+    ws.get_imbalance.return_value = 0.50  # Normal imbalance (not manipulated)
     return ws
 
 

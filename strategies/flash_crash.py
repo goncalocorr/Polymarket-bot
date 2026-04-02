@@ -3,7 +3,6 @@ Flash Crash Strategy — detects sudden probability drops on 15-min crypto marke
 Adapted from discountry/polymarket-trading-bot/strategies/flash_crash_strategy.py
 """
 
-import asyncio
 from datetime import datetime, timezone
 
 from loguru import logger
@@ -11,7 +10,9 @@ from loguru import logger
 import config
 from core.gamma_client import GammaClient
 from core.websocket_client import MarketWebSocket
+from data.market_quality import MarketQualityScorer
 from strategies.base import BaseStrategy, Signal
+from strategies.mispricing import _normalise_tokens
 
 
 class FlashCrashStrategy(BaseStrategy):
@@ -24,6 +25,7 @@ class FlashCrashStrategy(BaseStrategy):
         self,
         ws: MarketWebSocket,
         gamma: GammaClient,
+        quality_scorer: MarketQualityScorer | None = None,
         drop_threshold: float = config.FLASH_CRASH_DROP_THRESHOLD,
         lookback_seconds: float = config.FLASH_CRASH_LOOKBACK_SECONDS,
         size_usdc: float = config.FLASH_CRASH_SIZE_USDC,
@@ -33,6 +35,7 @@ class FlashCrashStrategy(BaseStrategy):
         super().__init__("flash_crash")
         self.ws = ws
         self.gamma = gamma
+        self.quality = quality_scorer
         self.drop_threshold = drop_threshold
         self.lookback_seconds = lookback_seconds
         self.size_usdc = size_usdc
@@ -50,7 +53,9 @@ class FlashCrashStrategy(BaseStrategy):
         markets = await self.gamma.get_15min_crypto_markets()
 
         for m in markets:
-            tokens = m.get("tokens", []) or m.get("clobTokenIds", [])
+            tokens = _normalise_tokens(
+                m.get("tokens", []) or m.get("clobTokenIds", [])
+            )
             question = m.get("question", "Unknown")
             for token in tokens:
                 token_id = token if isinstance(token, str) else token.get("token_id", "")
@@ -88,6 +93,25 @@ class FlashCrashStrategy(BaseStrategy):
                 continue
 
             if drop >= self.drop_threshold:
+                # Market quality gate
+                if self.quality:
+                    tradeable, report = self.quality.is_tradeable(token_id)
+                    if not tradeable:
+                        logger.debug(
+                            f"FlashCrash: Skipping {meta['question'][:40]}… — "
+                            f"low quality: {report}"
+                        )
+                        continue
+
+                # Order book imbalance check — avoid manipulated crashes
+                imbalance = self.ws.get_imbalance(token_id, levels=3)
+                if imbalance is not None and imbalance < 0.15:
+                    logger.debug(
+                        f"FlashCrash: Skipping {meta['question'][:40]}… — "
+                        f"extreme sell imbalance ({imbalance:.2f}), likely manipulation"
+                    )
+                    continue
+
                 logger.warning(
                     f"FlashCrash DETECTED: {meta['question']} "
                     f"dropped {drop:.3f} in {self.lookback_seconds}s "
@@ -146,7 +170,9 @@ class FlashCrashStrategy(BaseStrategy):
         markets = await self.gamma.get_15min_crypto_markets()
         new_count = 0
         for m in markets:
-            tokens = m.get("tokens", []) or m.get("clobTokenIds", [])
+            tokens = _normalise_tokens(
+                m.get("tokens", []) or m.get("clobTokenIds", [])
+            )
             question = m.get("question", "Unknown")
             for token in tokens:
                 token_id = token if isinstance(token, str) else token.get("token_id", "")

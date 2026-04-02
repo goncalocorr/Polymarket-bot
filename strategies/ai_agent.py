@@ -3,7 +3,6 @@ AI Agent Strategy — uses Claude to analyse markets in the grey zone
 where cross-market divergence is ambiguous (5-8%).
 """
 
-import asyncio
 from datetime import datetime, timezone
 
 from loguru import logger

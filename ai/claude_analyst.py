@@ -1,16 +1,22 @@
 """
 Market analysis via Anthropic Claude API.
 Adapted from Polymarket/agents, replacing OpenAI with Claude.
+Uses superforecaster prompt methodology for structured reasoning.
 """
 
+import asyncio
 import json
-import os
+import re
 from typing import Optional
 
 import anthropic
 from loguru import logger
 
 import config
+from ai.prompt_templates import SYSTEM_SUPERFORECASTER, superforecaster_prompt
+
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2.0
 
 
 class ClaudeAnalyst:
@@ -54,41 +60,71 @@ class ClaudeAnalyst:
                 f"- {n}" for n in recent_news[:5]
             )
 
-        prompt = f"""You are a prediction market analyst. Estimate the true probability
-of the following event resolving YES.
+        prompt = superforecaster_prompt(
+            question=market_data["question"],
+            price=market_data["price"],
+            volume=market_data.get("volume", 0),
+            end_date=market_data.get("end_date", "Unknown"),
+            external_info=external_info,
+            news_section=news_section,
+        )
 
-Market: {market_data['question']}
-Current Polymarket price: {market_data['price']} (implies {market_data['price']*100:.1f}% probability)
-24h volume: ${market_data.get('volume', 0):,.0f}
-Resolution date: {market_data.get('end_date', 'Unknown')}
+        text = ""
+        last_error: Optional[Exception] = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                client = self._get_client()
+                response = await client.messages.create(
+                    model=self.model,
+                    max_tokens=400,
+                    system=SYSTEM_SUPERFORECASTER,
+                    messages=[{"role": "user", "content": prompt}],
+                )
 
-{external_info}
+                if not response.content:
+                    logger.error("Claude returned empty content")
+                    return {"probability": 0.5, "confidence": 0.0, "reasoning": "Empty response"}
 
-{news_section}
+                text = response.content[0].text.strip()
+                break  # Success — exit retry loop
 
-Respond ONLY with valid JSON, no other text:
-{{"probability": 0.65, "confidence": 0.7, "reasoning": "brief explanation"}}
+            except anthropic.APIConnectionError as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"Claude API connection error (attempt {attempt + 1}/{MAX_RETRIES}): "
+                        f"{e} — retrying in {delay:.0f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except anthropic.RateLimitError as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"Claude rate limited (attempt {attempt + 1}/{MAX_RETRIES}): "
+                        f"retrying in {delay:.0f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except anthropic.APIError as e:
+                # Non-retryable API errors (auth, bad request, etc.)
+                logger.error(f"Claude API error: {e}")
+                raise
 
-Where:
-- probability: your estimate of YES probability (0.0 to 1.0)
-- confidence: how confident you are in this estimate (0.0 to 1.0)
-- reasoning: one sentence explanation"""
-
+        # Parse response
         try:
-            client = self._get_client()
-            response = await client.messages.create(
-                model=self.model,
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            text = response.content[0].text.strip()
-            # Extract JSON even if wrapped in markdown code block
-            if "```" in text:
-                text = text.split("```")[1]
-                if text.lower().startswith("json"):
-                    text = text[4:]
-                text = text.strip()
+            # Extract JSON from markdown code blocks (handles multiple blocks)
+            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+            if match:
+                text = match.group(1).strip()
+            elif text.startswith("```"):
+                # Fallback for unclosed code blocks
+                text = re.sub(r"^```(?:json)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text).strip()
 
             result = json.loads(text)
 
@@ -106,8 +142,5 @@ Where:
             return result
 
         except json.JSONDecodeError as e:
-            logger.error(f"Claude returned invalid JSON: {e}")
+            logger.error(f"Claude returned invalid JSON: {e}. Raw: {text[:200]!r}")
             return {"probability": 0.5, "confidence": 0.0, "reasoning": "Parse error"}
-        except anthropic.APIError as e:
-            logger.error(f"Claude API error: {e}")
-            raise

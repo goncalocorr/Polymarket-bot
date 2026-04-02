@@ -26,8 +26,11 @@ env/
 # Data
 data/*.db
 data/*.parquet
+docs/data/runtime_status.json
 logs/
 *.log
+tmp_test/
+.derived_poly_api.env
 
 # Docker
 .docker/

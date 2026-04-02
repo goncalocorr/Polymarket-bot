@@ -62,15 +62,16 @@ class MarketWebSocket:
             logger.error(f"WebSocket connection failed: {e}")
             raise
 
-    async def subscribe(self, token_id: str):
+    async def subscribe(self, token_id: str, force: bool = False):
         """Subscribe to order book updates for a token."""
         if not self._ws:
             raise RuntimeError("WebSocket not connected")
+        if token_id in self._subscriptions and not force:
+            return
 
         msg = json.dumps({
-            "type": "subscribe",
-            "channel": "book",
             "assets_ids": [token_id],
+            "operation": "subscribe",
         })
         await self._ws.send(msg)
         self._subscriptions.add(token_id)
@@ -82,9 +83,8 @@ class MarketWebSocket:
             return
 
         msg = json.dumps({
-            "type": "unsubscribe",
-            "channel": "book",
             "assets_ids": [token_id],
+            "operation": "unsubscribe",
         })
         await self._ws.send(msg)
         self._subscriptions.discard(token_id)
@@ -102,8 +102,11 @@ class MarketWebSocket:
         if not bids or not asks:
             return None
 
-        best_bid = float(bids[0]["price"])
-        best_ask = float(asks[0]["price"])
+        try:
+            best_bid = float(bids[0]["price"])
+            best_ask = float(asks[0]["price"])
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
         return (best_bid + best_ask) / 2
 
     def get_price_history(
@@ -137,26 +140,114 @@ class MarketWebSocket:
         """Get the current order book for a token."""
         return self._order_books.get(token_id)
 
+    def get_spread(self, token_id: str) -> Optional[float]:
+        """Get the bid-ask spread for a token (in price units)."""
+        book = self._order_books.get(token_id)
+        if not book:
+            return None
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        if not bids or not asks:
+            return None
+        try:
+            return float(asks[0]["price"]) - float(bids[0]["price"])
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+
+    def get_depth(self, token_id: str, levels: int = 5) -> Optional[dict]:
+        """
+        Get total bid/ask depth (volume) up to N levels.
+        Returns {"bid_depth": float, "ask_depth": float} or None.
+        """
+        book = self._order_books.get(token_id)
+        if not book:
+            return None
+        bids = book.get("bids", [])[:levels]
+        asks = book.get("asks", [])[:levels]
+        bid_depth = sum(float(b.get("size", 0)) for b in bids)
+        ask_depth = sum(float(a.get("size", 0)) for a in asks)
+        return {"bid_depth": bid_depth, "ask_depth": ask_depth}
+
+    def get_imbalance(self, token_id: str, levels: int = 5) -> Optional[float]:
+        """
+        Order book imbalance: bid_depth / (bid_depth + ask_depth).
+        Returns 0.0-1.0 where >0.5 = more buying pressure.
+        """
+        depth = self.get_depth(token_id, levels)
+        if not depth:
+            return None
+        total = depth["bid_depth"] + depth["ask_depth"]
+        if total == 0:
+            return None
+        return depth["bid_depth"] / total
+
+    def get_volatility(
+        self, token_id: str, lookback_seconds: float = 300.0
+    ) -> Optional[float]:
+        """
+        Price volatility (max - min) over a lookback window.
+        Useful for market quality scoring.
+        """
+        history = self.get_price_history(token_id, lookback_seconds)
+        if len(history) < 2:
+            return None
+        prices = [p for _, p in history]
+        return max(prices) - min(prices)
+
     async def _process_message(self, raw: str):
         """Process an incoming WebSocket message."""
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON from WebSocket: {raw[:100]}")
+            raw_text = raw.strip()
+            if raw_text == "NO NEW ASSETS":
+                logger.debug(f"WebSocket server notice: {raw_text}")
+            else:
+                logger.warning(f"Invalid JSON from WebSocket: {raw[:100]}")
             return
 
-        msg_type = data.get("type", "")
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    await self._handle_message(item)
+            return
+
+        if not isinstance(data, dict):
+            logger.debug(
+                f"Ignoring unexpected WebSocket payload type: {type(data).__name__}"
+            )
+            return
+
+        await self._handle_message(data)
+
+    async def _handle_message(self, data: dict):
+        """Handle a single decoded WebSocket payload."""
+        msg_type = data.get("event_type") or data.get("type", "")
 
         if msg_type == "book":
             token_id = data.get("asset_id", "")
             if not token_id:
                 return
 
-            book = {
-                "bids": data.get("bids", []),
-                "asks": data.get("asks", []),
-                "timestamp": data.get("timestamp", time.time()),
-            }
+            try:
+                book = {
+                    "bids": sorted(
+                        data.get("bids", []),
+                        key=lambda x: float(x.get("price", 0)),
+                        reverse=True,
+                    ),
+                    "asks": sorted(
+                        data.get("asks", []),
+                        key=lambda x: float(x.get("price", 0)),
+                    ),
+                    "timestamp": data.get("timestamp", time.time()),
+                }
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    f"Malformed order book data for {token_id}: {e}"
+                )
+                return
+
             self._order_books[token_id] = book
 
             # Calculate and record mid price
@@ -203,12 +294,16 @@ class MarketWebSocket:
         retries = 0
         while max_retries < 0 or retries < max_retries:
             connected_at = None
+            did_reconnect = False
             try:
-                await self.connect()
+                if not self._ws or not self._running:
+                    await self.connect()
+                    did_reconnect = True
                 connected_at = asyncio.get_running_loop().time()
-                # Re-subscribe to all tokens
-                for token_id in list(self._subscriptions):
-                    await self.subscribe(token_id)
+                # Re-subscribe to all tokens after reconnect
+                if did_reconnect:
+                    for token_id in list(self._subscriptions):
+                        await self.subscribe(token_id, force=True)
                 await self.listen()
             except Exception as e:
                 logger.error(f"WebSocket error (retry {retries}): {e}")

@@ -148,7 +148,20 @@ class ThreePhaseExecutor:
                     f"{remaining_size:.2f} remaining"
                 )
 
-            await self.bot.cancel_order(order_id)
+            cancelled = await self.bot.cancel_order(order_id)
+            if not cancelled:
+                logger.error(
+                    f"Phase {phase}: Failed to cancel order {order_id} — "
+                    f"aborting to avoid double exposure"
+                )
+                return ExecutionResult(
+                    filled=False,
+                    fill_price=total_cost / total_filled if total_filled > 0 else price,
+                    fill_size=total_filled,
+                    phases_used=phase,
+                    order_id=order_id,
+                    error="Cancel failed — manual intervention needed",
+                )
 
         avg_price = total_cost / total_filled if total_filled > 0 else price
         return ExecutionResult(
@@ -163,12 +176,13 @@ class ThreePhaseExecutor:
         """
         Poll order status until filled or timeout.
         Returns the filled amount in USDC, or -1.0 on transient API failure.
+        Uses wall-clock time so HTTP latency counts towards the timeout.
         """
-        elapsed = 0
         poll_interval = 2.0
         consecutive_errors = 0
+        deadline = asyncio.get_running_loop().time() + timeout
 
-        while elapsed < timeout:
+        while asyncio.get_running_loop().time() < deadline:
             order = await self.bot.get_order(order_id)
             if not order:
                 consecutive_errors += 1
@@ -176,7 +190,6 @@ class ThreePhaseExecutor:
                     logger.warning(f"Order {order_id}: API unreachable after 3 retries")
                     return -1.0
                 await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
                 continue
 
             consecutive_errors = 0
@@ -190,6 +203,5 @@ class ThreePhaseExecutor:
                 return filled
 
             await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
 
         return 0.0
