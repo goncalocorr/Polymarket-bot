@@ -1,7 +1,4 @@
-"""
-AI Agent Strategy — uses Claude to analyse markets in the grey zone
-where cross-market divergence is ambiguous (5-8%).
-"""
+"""AI Agent Strategy for grey-zone market analysis."""
 
 import json
 from datetime import datetime, timezone
@@ -9,7 +6,7 @@ from datetime import datetime, timezone
 from loguru import logger
 
 import config
-from ai.claude_analyst import ClaudeAnalyst
+from ai.base_analyst import MarketAnalyst
 from core.gamma_client import GammaClient
 from data.external_sources import ExternalSources
 from strategies.base import BaseStrategy, Signal
@@ -18,16 +15,16 @@ from strategies.mispricing import _parse_outcome_price, _pick_token_id
 
 class AIAgentStrategy(BaseStrategy):
     """
-    Uses Claude API as a qualitative confirmation layer.
+    Uses an AI analyst as a qualitative confirmation layer.
     Only invoked when mispricing divergence is in the grey zone (5-8%).
-    Limited to MAX_CLAUDE_CALLS_PER_DAY to control costs.
+    Limited to MAX_AI_CALLS_PER_DAY to control costs.
     """
 
     def __init__(
         self,
         gamma: GammaClient,
         external: ExternalSources,
-        analyst: ClaudeAnalyst,
+        analyst: MarketAnalyst,
         db=None,
         grey_zone_min: float = 0.05,
         grey_zone_max: float = 0.08,
@@ -56,6 +53,11 @@ class AIAgentStrategy(BaseStrategy):
 
     def _load_daily_counter(self):
         if not self.db:
+            # Even without a DB, set the date so _reset_daily_counter
+            # doesn't reset the counter on every single cycle.
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            self._last_reset_date = today
+            self._calls_today = 0
             return
 
         raw = self.db.get_state(self._state_key)
@@ -71,7 +73,7 @@ class AIAgentStrategy(BaseStrategy):
             state_date = str(state.get("date", ""))
             state_calls = int(state.get("calls", 0) or 0)
         except (ValueError, TypeError, json.JSONDecodeError):
-            logger.warning("AIAgent: Invalid persisted Claude call counter, resetting")
+            logger.warning("AIAgent: Invalid persisted AI call counter, resetting")
             self._last_reset_date = today
             self._calls_today = 0
             self._persist_daily_counter()
@@ -100,19 +102,23 @@ class AIAgentStrategy(BaseStrategy):
         self._reset_daily_counter()
         if not getattr(self.analyst, "api_key", ""):
             self.disable()
+            missing_env = getattr(self.analyst, "required_api_key_env", "AI API key")
             logger.warning(
-                "AIAgent: Disabled because ANTHROPIC_API_KEY is not configured"
+                f"AIAgent: Disabled because {missing_env} is not configured"
             )
             return
-        logger.info("AIAgent: Strategy initialized")
+
+        provider = getattr(self.analyst, "provider_name", "unknown")
+        model = getattr(self.analyst, "model", "unknown")
+        logger.info(f"AIAgent: Strategy initialized ({provider}:{model})")
 
     async def evaluate(self) -> list[Signal]:
-        """Find grey-zone markets and ask Claude for confirmation."""
+        """Find grey-zone markets and ask the configured AI provider for confirmation."""
         if not self.is_active:
             return []
 
         self._reset_daily_counter()
-        if self._calls_today >= config.MAX_CLAUDE_CALLS_PER_DAY:
+        if self._calls_today >= config.MAX_AI_CALLS_PER_DAY:
             logger.debug("AIAgent: Daily call limit reached")
             return []
 
@@ -120,18 +126,19 @@ class AIAgentStrategy(BaseStrategy):
         poly_markets = await self.gamma.get_markets_for_mispricing()
         markets_with_external = 0
         grey_zone_candidates = 0
-        claude_calls_this_cycle = 0
+        ai_calls_this_cycle = 0
 
         for market in poly_markets:
-            if self._calls_today >= config.MAX_CLAUDE_CALLS_PER_DAY:
+            if self._calls_today >= config.MAX_AI_CALLS_PER_DAY:
                 break
 
             question = market.get("question", "")
-            poly_price = _parse_outcome_price(market.get("outcomePrices"))
+            poly_price = _parse_outcome_price(market.get("outcomePrices"), default=None)
+            if poly_price is None:
+                continue
             volume_24h = float(market.get("volume24hr", 0) or 0)
             end_date = market.get("endDate", "")
 
-            # Find external prices
             external_prices = await self.external.find_matching_prices(question)
             if not external_prices:
                 continue
@@ -140,15 +147,11 @@ class AIAgentStrategy(BaseStrategy):
             avg_external = sum(external_prices.values()) / len(external_prices)
             divergence = abs(avg_external - poly_price)
 
-            # Only process grey zone divergences
             if not (self.grey_zone_min <= divergence <= self.grey_zone_max):
                 continue
             grey_zone_candidates += 1
 
-            # Fetch recent news for context
             news = await self.external.get_recent_news(question)
-
-            # Ask Claude
             market_data = {
                 "question": question,
                 "price": poly_price,
@@ -160,41 +163,44 @@ class AIAgentStrategy(BaseStrategy):
             try:
                 analysis = await self.analyst.analyse_market(market_data, news)
                 self._calls_today += 1
-                claude_calls_this_cycle += 1
+                ai_calls_this_cycle += 1
                 self._persist_daily_counter()
             except Exception as e:
-                logger.error(f"AIAgent: Claude analysis failed for '{question}': {e}")
-                continue
-
-            claude_prob = analysis.get("probability", 0.5)
-            claude_confidence = analysis.get("confidence", 0.0)
-            reasoning = analysis.get("reasoning", "")
-
-            # Claude must agree with external sources AND be confident enough
-            claude_divergence = claude_prob - poly_price
-            if abs(claude_divergence) < self.grey_zone_min:
-                logger.debug(
-                    f"AIAgent: Claude says fair price for '{question[:50]}...'"
+                provider = getattr(self.analyst, "provider_name", "AI")
+                logger.error(
+                    f"AIAgent: {provider} analysis failed for '{question}': {e}"
                 )
                 continue
 
-            if claude_confidence < 0.6:
+            ai_prob = analysis.get("probability", 0.5)
+            ai_confidence = analysis.get("confidence", 0.0)
+            reasoning = analysis.get("reasoning", "")
+
+            ai_divergence = ai_prob - poly_price
+            if abs(ai_divergence) < self.grey_zone_min:
                 logger.debug(
-                    f"AIAgent: Low confidence ({claude_confidence:.2f}) for "
+                    f"AIAgent: AI says fair price for '{question[:50]}...'"
+                )
+                continue
+
+            if ai_confidence < 0.6:
+                logger.debug(
+                    f"AIAgent: Low confidence ({ai_confidence:.2f}) for "
                     f"'{question[:50]}...'"
                 )
                 continue
 
-            # Generate signal
-            if claude_divergence > 0:
+            if ai_divergence > 0:
                 side = "BUY"
                 price = poly_price
+                estimated_prob = ai_prob
             else:
                 side = "BUY"
                 price = 1.0 - poly_price
+                estimated_prob = 1.0 - ai_prob
 
             tokens = market.get("tokens", []) or market.get("clobTokenIds", [])
-            token_id = _pick_token_id(tokens, is_yes=(claude_divergence > 0))
+            token_id = _pick_token_id(tokens, is_yes=(ai_divergence > 0))
 
             if not token_id:
                 continue
@@ -205,35 +211,40 @@ class AIAgentStrategy(BaseStrategy):
                 market_question=question,
                 side=side,
                 price=price,
-                size_usdc=0,  # Calculated by risk manager
-                confidence=claude_confidence,
+                size_usdc=0,
+                estimated_prob=estimated_prob,
+                confidence=ai_confidence,
                 reasoning=(
-                    f"Claude estimate: {claude_prob:.2f} (confidence: "
-                    f"{claude_confidence:.2f}). {reasoning}"
+                    f"AI estimate: {ai_prob:.2f} (confidence: "
+                    f"{ai_confidence:.2f}). {reasoning}"
                 ),
             )
             signals.append(signal)
 
             q_display = question[:60] + ("..." if len(question) > 60 else "")
             logger.info(
-                f"AIAgent: Signal for '{q_display}' — "
-                f"Claude prob={claude_prob:.2f}, conf={claude_confidence:.2f}"
+                f"AIAgent: Signal for '{q_display}' - "
+                f"AI prob={ai_prob:.2f}, conf={ai_confidence:.2f}"
             )
 
         logger.debug(
-            "AIAgent: scan summary — "
+            "AIAgent: scan summary - "
             f"markets={len(poly_markets)} "
             f"external={markets_with_external} "
             f"grey_zone={grey_zone_candidates} "
-            f"claude_calls={claude_calls_this_cycle} "
+            f"ai_calls={ai_calls_this_cycle} "
             f"signals={len(signals)} "
-            f"remaining_budget={max(config.MAX_CLAUDE_CALLS_PER_DAY - self._calls_today, 0)}"
+            f"remaining_budget={max(config.MAX_AI_CALLS_PER_DAY - self._calls_today, 0)}"
         )
 
         return signals
 
     async def shutdown(self):
         self._persist_daily_counter()
+        close = getattr(self.analyst, "close", None)
+        if callable(close):
+            await close()
         logger.info(
-            f"AIAgent: Shut down (used {self._calls_today} Claude calls today)"
+            f"AIAgent: Shut down (used {self._calls_today} AI calls today)"
         )
+

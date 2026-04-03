@@ -109,6 +109,34 @@ class MarketWebSocket:
             return None
         return (best_bid + best_ask) / 2
 
+    def get_best_bid_ask(self, token_id: str) -> tuple[Optional[float], Optional[float]]:
+        """Return the best bid and ask for a token, when available."""
+        book = self._order_books.get(token_id)
+        if not book:
+            return None, None
+
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        try:
+            best_bid = float(bids[0]["price"]) if bids else None
+            best_ask = float(asks[0]["price"]) if asks else None
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None, None
+        return best_bid, best_ask
+
+    def get_book_age_seconds(self, token_id: str) -> Optional[float]:
+        """Return the age of the most recent book snapshot for a token."""
+        book = self._order_books.get(token_id)
+        if not book:
+            return None
+        try:
+            ts = float(book.get("timestamp", 0))
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0:
+            return None
+        return max(0.0, time.time() - ts)
+
     def get_price_history(
         self, token_id: str, lookback_seconds: float = 12.0
     ) -> list[tuple[float, float]]:
@@ -300,8 +328,9 @@ class MarketWebSocket:
                     await self.connect()
                     did_reconnect = True
                 connected_at = asyncio.get_running_loop().time()
-                # Re-subscribe to all tokens after reconnect
+                # Clear stale book data and re-subscribe after reconnect
                 if did_reconnect:
+                    self._order_books.clear()
                     for token_id in list(self._subscriptions):
                         await self.subscribe(token_id, force=True)
                 await self.listen()
@@ -313,6 +342,9 @@ class MarketWebSocket:
                 retries = 0
             else:
                 retries += 1
+
+            if not self._running:
+                break
 
             wait = min(2 ** retries, 60)
             logger.info(f"Reconnecting in {wait}s...")

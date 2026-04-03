@@ -9,8 +9,11 @@ import re
 import time
 from difflib import SequenceMatcher
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 from loguru import logger
 
 import config
@@ -24,6 +27,9 @@ _metaculus_last_call_ts = 0.0
 _metaculus_disabled_until = 0.0
 _metaculus_rate_lock = asyncio.Lock()
 _kalshi_skip_logged = False
+_kalshi_markets_cache: tuple[float, list[dict]] = (0.0, [])
+_kalshi_markets_lock = asyncio.Lock()
+_external_price_cache: dict[str, tuple[float, dict[str, float]]] = {}
 
 
 def _metaculus_cache_get(question: str) -> tuple[bool, Optional[float]]:
@@ -53,12 +59,16 @@ def _metaculus_cache_set(question: str, value: Optional[float]):
 async def _metaculus_throttle():
     """Enforce a minimum delay between Metaculus requests globally."""
     global _metaculus_last_call_ts
-    async with _metaculus_rate_lock:
-        elapsed = time.time() - _metaculus_last_call_ts
-        wait_for = _METACULUS_MIN_INTERVAL_S - elapsed
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
-        _metaculus_last_call_ts = time.time()
+    # Compute wait time under lock but sleep outside to avoid blocking
+    # concurrent callers for the full delay.
+    while True:
+        async with _metaculus_rate_lock:
+            elapsed = time.time() - _metaculus_last_call_ts
+            wait_for = _METACULUS_MIN_INTERVAL_S - elapsed
+            if wait_for <= 0:
+                _metaculus_last_call_ts = time.time()
+                return
+        await asyncio.sleep(min(wait_for, _METACULUS_MIN_INTERVAL_S))
 
 
 class ExternalSources:
@@ -66,6 +76,7 @@ class ExternalSources:
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
+        self._kalshi_private_key = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -84,42 +95,96 @@ class ExternalSources:
 
     # --- Kalshi ---
 
+    def _load_kalshi_private_key(self):
+        if self._kalshi_private_key is not None:
+            # Sentinel False means a previous load attempt failed — don't retry
+            return None if self._kalshi_private_key is False else self._kalshi_private_key
+
+        secret = config.KALSHI_API_SECRET
+        if not secret:
+            return None
+
+        try:
+            key_bytes = secret.encode("utf-8")
+            self._kalshi_private_key = serialization.load_pem_private_key(
+                key_bytes,
+                password=None,
+            )
+            return self._kalshi_private_key
+        except Exception as e:
+            logger.warning(f"Kalshi: Failed to load private key: {type(e).__name__}: {e}")
+            self._kalshi_private_key = False  # Memoize failure
+            return None
+
+    def _kalshi_auth_headers(self, method: str, path: str) -> dict[str, str]:
+        """Build Kalshi auth headers. `path` must be the API-relative path (e.g. "/markets")."""
+        private_key = self._load_kalshi_private_key()
+        if private_key is None:
+            raise ValueError("Kalshi private key not loaded — check KALSHI_API_SECRET")
+        timestamp = str(int(time.time() * 1000))
+        # Sign only the API-relative path, not the full URL
+        sign_path = path.split("?")[0]
+        message = f"{timestamp}{method.upper()}{sign_path}".encode("utf-8")
+        signature = private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return {
+            "KALSHI-ACCESS-KEY": config.KALSHI_API_KEY,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+            "Accept": "application/json",
+        }
+
     async def get_kalshi_markets(self, limit: int = 100) -> list[dict]:
         """Fetch markets from Kalshi. Requires API credentials for v2 API."""
-        global _kalshi_skip_logged
+        global _kalshi_skip_logged, _kalshi_markets_cache
         if not config.KALSHI_API_KEY or not config.KALSHI_API_SECRET:
             if not _kalshi_skip_logged:
                 logger.debug("Kalshi: No API credentials configured, skipping")
                 _kalshi_skip_logged = True
             return []
 
-        auth_raw = f"{config.KALSHI_API_KEY}:{config.KALSHI_API_SECRET}"
-        auth_b64 = base64.b64encode(auth_raw.encode("utf-8")).decode("utf-8")
+        cached_ts, cached_markets = _kalshi_markets_cache
+        if time.time() - cached_ts <= config.KALSHI_MARKETS_CACHE_TTL_S:
+            return cached_markets
 
-        client = await self._get_client()
-        try:
-            resp = await client.get(
-                config.KALSHI_API_URL,
-                params={"limit": limit, "status": "open"},
-                headers={
-                    "Authorization": f"Basic {auth_b64}",
-                    "Accept": "application/json",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("markets", [])
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401:
-                logger.debug(
-                    "Kalshi: Authentication failed (401) — check KALSHI_API_KEY/SECRET"
+        async with _kalshi_markets_lock:
+            cached_ts, cached_markets = _kalshi_markets_cache
+            if time.time() - cached_ts <= config.KALSHI_MARKETS_CACHE_TTL_S:
+                return cached_markets
+
+            client = await self._get_client()
+            try:
+                path = "/markets"
+                resp = await client.get(
+                    f"{config.KALSHI_API_URL}{path}",
+                    params={"limit": limit, "status": "open"},
+                    headers=self._kalshi_auth_headers("GET", path),
                 )
-            else:
-                logger.debug(f"Kalshi API error: {e.response.status_code}")
-            return []
-        except httpx.HTTPError as e:
-            logger.debug(f"Kalshi API connection error: {type(e).__name__}")
-            return []
+                resp.raise_for_status()
+                data = resp.json()
+                markets = data.get("markets", [])
+                _kalshi_markets_cache = (time.time(), markets)
+                return markets
+            except ValueError as e:
+                logger.debug(f"Kalshi: Invalid private key format: {e}")
+                return []
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 401:
+                    logger.debug(
+                        "Kalshi: Authentication failed (401) — check KALSHI API key/private key"
+                    )
+                else:
+                    logger.debug(f"Kalshi API error: {e.response.status_code}")
+                return []
+            except httpx.HTTPError as e:
+                logger.debug(f"Kalshi API connection error: {type(e).__name__}")
+                return []
 
     async def get_kalshi_price(self, question: str) -> Optional[float]:
         try:
@@ -179,8 +244,9 @@ class ExternalSources:
             _metaculus_cache_set(question, None)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
+                _metaculus_cache_set(question, None)
                 logger.debug(
-                    "Metaculus: Rate limited (429) — result will be retried next cycle"
+                    "Metaculus: Rate limited (429) — cached None to avoid repeated delays"
                 )
             elif e.response.status_code == 403:
                 _metaculus_disabled_until = (
@@ -237,6 +303,11 @@ class ExternalSources:
 
         Each source is independent — one failure never blocks the others.
         """
+        cache_key = question[:100].lower().strip()
+        cached = _external_price_cache.get(cache_key)
+        if cached and time.time() - cached[0] <= config.EXTERNAL_PRICE_CACHE_TTL_S:
+            return dict(cached[1])
+
         async def _safe_fetch(name: str, fetch_coro):
             try:
                 value = await fetch_coro
@@ -262,6 +333,12 @@ class ExternalSources:
         if manifold is not None:
             results["manifold"] = manifold
 
+        _external_price_cache[cache_key] = (time.time(), dict(results))
+        if len(_external_price_cache) > 1000:
+            oldest = sorted(_external_price_cache, key=lambda k: _external_price_cache[k][0])
+            for key in oldest[:500]:
+                _external_price_cache.pop(key, None)
+
         return results
 
     # --- News ---
@@ -283,9 +360,9 @@ class ExternalSources:
                     "q": clean_query,
                     "sortBy": "publishedAt",
                     "pageSize": max_results,
-                    "apiKey": config.NEWSAPI_KEY,
                     "language": "en",
                 },
+                headers={"X-Api-Key": config.NEWSAPI_KEY},
             )
             resp.raise_for_status()
             articles = resp.json().get("articles", [])

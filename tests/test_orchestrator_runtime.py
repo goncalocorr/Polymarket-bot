@@ -158,12 +158,13 @@ def test_status_writer_includes_close_reason_for_recent_trades():
     assert status["recent_trades"][0]["close_reason"] == "take-profit"
 
 
-def test_restore_risk_state_from_db_in_dry_run_recovers_capital_and_stop():
+@pytest.mark.asyncio
+async def test_restore_risk_state_from_db_in_dry_run_recovers_capital_and_stop():
     orch = Orchestrator.__new__(Orchestrator)
     orch._initial_capital = 500.0
     orch.risk_manager = SimpleNamespace(
         total_capital=500.0,
-        restore_state=MagicMock(),
+        restore_state=AsyncMock(),
     )
     latest_loss = datetime.now(timezone.utc) - timedelta(minutes=10)
     orch.db = SimpleNamespace(
@@ -179,13 +180,53 @@ def test_restore_risk_state_from_db_in_dry_run_recovers_capital_and_stop():
     )
 
     with patch.object(config, "DRY_RUN", True):
-        Orchestrator._restore_risk_state_from_db(orch)
+        await Orchestrator._restore_risk_state_from_db(orch)
 
     orch.risk_manager.restore_state.assert_called_once()
     kwargs = orch.risk_manager.restore_state.call_args.kwargs
     assert kwargs["total_capital"] == pytest.approx(473.36)
     assert kwargs["daily_pnl"] == pytest.approx(-26.64)
     assert kwargs["circuit_breaker_until"] is not None
+
+
+@pytest.mark.asyncio
+async def test_restore_risk_state_ignores_time_stop_losses_for_circuit_breaker_in_dry_run():
+    orch = Orchestrator.__new__(Orchestrator)
+    orch._initial_capital = 500.0
+    orch.risk_manager = SimpleNamespace(
+        total_capital=500.0,
+        restore_state=AsyncMock(),
+    )
+    latest_loss = datetime.now(timezone.utc) - timedelta(minutes=10)
+    orch.db = SimpleNamespace(
+        get_today_pnl=MagicMock(return_value=-3.58),
+        get_total_pnl=MagicMock(return_value=-3.58),
+        get_recent_trades=MagicMock(
+            return_value=[
+                {
+                    "pnl_usdc": -0.31,
+                    "close_reason": "time-stop",
+                    "closed_at": latest_loss.isoformat(),
+                },
+                {
+                    "pnl_usdc": -3.11,
+                    "close_reason": "time-stop",
+                    "closed_at": (latest_loss - timedelta(hours=2)).isoformat(),
+                },
+                {
+                    "pnl_usdc": -0.16,
+                    "close_reason": "time-stop",
+                    "closed_at": (latest_loss - timedelta(hours=10)).isoformat(),
+                },
+            ]
+        ),
+    )
+
+    with patch.object(config, "DRY_RUN", True):
+        await Orchestrator._restore_risk_state_from_db(orch)
+
+    kwargs = orch.risk_manager.restore_state.call_args.kwargs
+    assert kwargs["circuit_breaker_until"] is None
 
 
 @pytest.mark.asyncio
@@ -198,7 +239,7 @@ async def test_start_restores_mispricing_runtime_state():
     orch.bot = SimpleNamespace(api_creds=None)
     orch.risk_manager = SimpleNamespace(
         total_capital=500.0,
-        restore_state=MagicMock(),
+        restore_state=AsyncMock(),
     )
     open_positions = [SimpleNamespace(id="pos-1")]
     open_trades = [{"id": "pos-1"}]
@@ -290,4 +331,8 @@ async def test_finalize_closed_position_uses_persisted_close_reason():
         "stop-loss",
     )
     orch.telegram.position_closed.assert_awaited_once()
+    orch.risk_manager.record_trade_result.assert_awaited_once_with(
+        -12.0,
+        close_reason="stop-loss",
+    )
     assert orch.telegram.position_closed.await_args.args[3] == "stop-loss"

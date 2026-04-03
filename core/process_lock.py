@@ -38,7 +38,7 @@ class SingleInstanceLock:
                 import msvcrt
 
                 self._handle.seek(0)
-                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 256)
             except ImportError:
                 import fcntl
 
@@ -66,7 +66,7 @@ class SingleInstanceLock:
                 import msvcrt
 
                 self._handle.seek(0)
-                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 256)
             except ImportError:
                 import fcntl
 

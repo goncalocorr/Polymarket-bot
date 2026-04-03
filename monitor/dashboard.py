@@ -38,12 +38,36 @@ class StatusWriter:
         self.strategies = strategies
         self._running = False
 
+    def _build_open_positions(self, open_positions) -> list[dict]:
+        result = []
+        for p in open_positions:
+            cur_price = self.order_manager.ws.get_mid_price(p.token_id) or p.entry_price
+            result.append({
+                "market": p.market_question[:100],
+                "side": p.side,
+                "entry_price": p.entry_price,
+                "current_price": round(cur_price, 4),
+                "size_usdc": round(p.size_usdc, 2),
+                "unrealised_pnl_usdc": round(p.current_pnl(cur_price), 2),
+            })
+        return result
+
     def _build_status(self) -> dict:
         now = datetime.now(timezone.utc)
         open_positions = self.order_manager.get_open_positions()
         recent_trades = self.db.get_recent_trades(10)
         pnl_today = self.db.get_today_pnl()
         updated_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        strategy_details = {}
+        for strategy in self.strategies:
+            payload_fn = getattr(strategy, "status_payload", None)
+            if callable(payload_fn):
+                try:
+                    strategy_details[strategy.name] = payload_fn()
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to build status payload for {strategy.name}: {e}"
+                    )
 
         return {
             "updated_at": updated_at,
@@ -61,25 +85,7 @@ class StatusWriter:
                 2,
             ),
             "pnl_total_usdc": round(self.db.get_total_pnl(), 2),
-            "open_positions": [
-                {
-                    "market": p.market_question[:100],
-                    "side": p.side,
-                    "entry_price": p.entry_price,
-                    "current_price": round(
-                        self.order_manager.ws.get_mid_price(p.token_id) or p.entry_price,
-                        4,
-                    ),
-                    "size_usdc": round(p.size_usdc, 2),
-                    "unrealised_pnl_usdc": round(
-                        p.current_pnl(
-                            self.order_manager.ws.get_mid_price(p.token_id) or p.entry_price
-                        ),
-                        2,
-                    ),
-                }
-                for p in open_positions
-            ],
+            "open_positions": self._build_open_positions(open_positions),
             "recent_trades": [
                 {
                     "market": t.get("market_question", "")[:100],
@@ -95,6 +101,8 @@ class StatusWriter:
             "strategies": {
                 s.name: s.state.value for s in self.strategies
             },
+            "strategy_details": strategy_details,
+            "maker": strategy_details.get("reward_market_maker", {}),
         }
 
     async def write_status(self):
@@ -103,8 +111,11 @@ class StatusWriter:
             status = self._build_status()
             path = config.STATUS_JSON_PATH
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w") as f:
+            # Atomic write: write to temp file then replace to avoid partial reads
+            tmp_path = path.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
                 json.dump(status, f, indent=2)
+            tmp_path.replace(path)
         except Exception as e:
             logger.error(f"Failed to write status.json: {e}")
 
@@ -247,6 +258,59 @@ class TerminalDashboard:
 
         return Panel(table, title="Strategies", border_style="magenta")
 
+    def _make_maker(self) -> Panel:
+        maker = {}
+        for strategy in self.strategies:
+            payload_fn = getattr(strategy, "status_payload", None)
+            if callable(payload_fn) and strategy.name == "reward_market_maker":
+                try:
+                    maker = payload_fn()
+                except Exception:
+                    maker = {}
+                break
+
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Label", style="dim")
+        table.add_column("Value", justify="right")
+
+        def _fmt_small_usd(value: float) -> str:
+            return f"${value:.4f}" if 0 < abs(value) < 0.01 else f"${value:.2f}"
+
+        if not maker:
+            table.add_row("Maker", "Not available")
+        else:
+            table.add_row("Active Quotes", str(maker.get("active_quotes", 0)))
+            table.add_row(
+                "Committed",
+                f"${maker.get('committed_capital_usdc', 0):.2f}",
+            )
+            table.add_row(
+                "Inventory",
+                f"${maker.get('inventory_notional_usdc', 0):.2f}",
+            )
+            table.add_row(
+                "Est. Daily Rewards",
+                _fmt_small_usd(maker.get("estimated_daily_rewards_usdc", 0)),
+            )
+            table.add_row(
+                "Est. Daily Yield",
+                f"{maker.get('estimated_daily_reward_yield_pct', 0):.4f}%",
+            )
+            table.add_row(
+                "Accrued Rewards*",
+                _fmt_small_usd(maker.get("estimated_rewards_accrued_usdc", 0)),
+            )
+            table.add_row(
+                "Est. Total P&L*",
+                f"${maker.get('estimated_total_pnl_usdc', 0):+.4f}",
+            )
+            table.add_row(
+                "Realized P&L",
+                f"${maker.get('realized_pnl_usdc', 0):+.2f}",
+            )
+
+        return Panel(table, title="Maker", border_style="blue")
+
     def render(self) -> Layout:
         layout = Layout()
         layout.split_column(
@@ -263,6 +327,7 @@ class TerminalDashboard:
         )
         layout["right"].split_column(
             Layout(self._make_strategies(), size=8),
+            Layout(self._make_maker(), size=8),
             Layout(self._make_trades()),
         )
         return layout

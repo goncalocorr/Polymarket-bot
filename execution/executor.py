@@ -165,11 +165,12 @@ class ThreePhaseExecutor:
 
             if filled_size >= remaining_size * 0.95:
                 # Fully filled (within 5% tolerance)
+                actual_price = await self._get_fill_price(order_id, phase_price)
                 total_filled += filled_size
-                total_cost += filled_size * phase_price
+                total_cost += filled_size * actual_price
                 return ExecutionResult(
                     filled=True,
-                    fill_price=total_cost / total_filled if total_filled > 0 else phase_price,
+                    fill_price=total_cost / total_filled if total_filled > 0 else actual_price,
                     fill_size=total_filled,
                     phases_used=phase,
                     order_id=order_id,
@@ -177,8 +178,9 @@ class ThreePhaseExecutor:
 
             # Partially filled or unfilled — cancel remaining
             if filled_size > 0:
+                actual_price = await self._get_fill_price(order_id, phase_price)
                 total_filled += filled_size
-                total_cost += filled_size * phase_price
+                total_cost += filled_size * actual_price
                 remaining_size -= filled_size
                 logger.info(
                     f"Phase {phase}: Partially filled {filled_size:.2f} USDC, "
@@ -208,6 +210,22 @@ class ThreePhaseExecutor:
             phases_used=3,
             error="All phases exhausted",
         )
+
+    async def _get_fill_price(self, order_id: str, fallback: float) -> float:
+        """Fetch the actual fill price from order details, falling back to limit price."""
+        try:
+            details = await self.bot.get_order(order_id)
+            if details:
+                for key in ("avgPrice", "price"):
+                    try:
+                        val = float(details.get(key, 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if val > 0:
+                        return val
+        except Exception as e:
+            logger.debug(f"Could not fetch fill price for {order_id}: {e}")
+        return fallback
 
     async def _wait_for_fill(self, order_id: str, timeout: float) -> float:
         """

@@ -16,12 +16,15 @@ from data.market_quality import MarketQualityScorer
 from strategies.base import BaseStrategy, Signal
 
 
-def _parse_outcome_price(raw: str | list | None, default: float = 0.5) -> float:
-    """Safely parse Gamma outcomePrices payloads."""
+def _parse_outcome_price(raw: str | list | None, default: float | None = 0.5) -> float | None:
+    """Safely parse Gamma outcomePrices payloads. Returns default on failure."""
     if raw is None:
         return default
     if isinstance(raw, list):
-        return float(raw[0]) if raw else default
+        try:
+            return float(raw[0]) if raw else default
+        except (ValueError, TypeError):
+            return default
     if isinstance(raw, str):
         try:
             return float(raw.strip("[]").split(",")[0])
@@ -99,8 +102,17 @@ class MispricingStrategy(BaseStrategy):
         self.close_threshold = close_threshold
         self.max_position_pct = max_position_pct
         self.reentry_cooldown = timedelta(minutes=reentry_cooldown_min)
+        self.strikeout_threshold = max(config.MISPRICING_STRIKEOUT_LOSSES, 1)
+        self.strikeout_lookback = timedelta(
+            hours=config.MISPRICING_STRIKEOUT_LOOKBACK_HOURS
+        )
+        self.strikeout_pause = timedelta(
+            hours=config.MISPRICING_STRIKEOUT_PAUSE_HOURS
+        )
         self._subscribed_tokens: set[str] = set()
         self._cooldown_until: dict[str, datetime] = {}
+        self._loss_events: dict[str, list[datetime]] = {}
+        self._blocked_until: dict[str, datetime] = {}
 
     async def initialize(self):
         logger.info("Mispricing: Strategy initialized")
@@ -176,10 +188,55 @@ class MispricingStrategy(BaseStrategy):
             return False
         return True
 
+    def _in_strikeout_block(self, token_id: str) -> bool:
+        blocked_until = self._blocked_until.get(token_id)
+        if not blocked_until:
+            return False
+        if datetime.now(timezone.utc) >= blocked_until:
+            del self._blocked_until[token_id]
+            return False
+        return True
+
+    def _record_loss_event(
+        self,
+        token_id: str,
+        occurred_at: datetime,
+        reason: str = "",
+    ):
+        events = self._loss_events.setdefault(token_id, [])
+        cutoff = datetime.now(timezone.utc) - self.strikeout_lookback
+        events = [dt for dt in events if dt >= cutoff]
+        events.append(occurred_at)
+        events.sort()
+        self._loss_events[token_id] = events
+
+        if len(events) < self.strikeout_threshold:
+            return
+
+        blocked_until = max(events) + self.strikeout_pause
+        if blocked_until <= datetime.now(timezone.utc):
+            return
+        previous = self._blocked_until.get(token_id)
+        if not previous or blocked_until > previous:
+            self._blocked_until[token_id] = blocked_until
+            logger.warning(
+                f"Mispricing: Strikeout block on {token_id[:16]}... until "
+                f"{blocked_until.strftime('%H:%M UTC')} after {len(events)} losses "
+                f"in {int(self.strikeout_lookback.total_seconds() // 3600)}h"
+                f"{f' ({reason})' if reason else ''}"
+            )
+
     def record_closed_trade(self, token_id: str, pnl_usdc: float, reason: str = ""):
         """Avoid immediate re-entry after a stop or losing exit."""
         normalized_reason = (reason or "").lower()
         is_stop_reason = "stop" in normalized_reason
+        is_loss = pnl_usdc < 0
+        if is_loss:
+            self._record_loss_event(
+                token_id,
+                datetime.now(timezone.utc),
+                reason=reason,
+            )
         if pnl_usdc >= 0 and not is_stop_reason:
             return
         until = datetime.now(timezone.utc) + self.reentry_cooldown
@@ -217,6 +274,11 @@ class MispricingStrategy(BaseStrategy):
                 previous = self._cooldown_until.get(token_id)
                 if not previous or until > previous:
                     self._cooldown_until[token_id] = until
+            self._record_loss_event(
+                token_id,
+                closed_dt,
+                reason=str(trade.get("close_reason", "") or ""),
+            )
 
         for pos in open_positions:
             if getattr(pos, "strategy", "") != self.name:
@@ -279,7 +341,9 @@ class MispricingStrategy(BaseStrategy):
 
         for market in poly_markets:
             question = market.get("question", "")
-            poly_price = _parse_outcome_price(market.get("outcomePrices"))
+            poly_price = _parse_outcome_price(market.get("outcomePrices"), default=None)
+            if poly_price is None:
+                continue
             external_prices = await self.external.find_matching_prices(question)
             if not external_prices:
                 continue
@@ -320,6 +384,12 @@ class MispricingStrategy(BaseStrategy):
             if self._in_reentry_cooldown(token_id):
                 logger.debug(
                     f"Mispricing: Cooldown active for '{question[:40]}...', skipping"
+                )
+                continue
+
+            if self._in_strikeout_block(token_id):
+                logger.info(
+                    f"Mispricing: Strikeout block active for '{question[:40]}...', skipping"
                 )
                 continue
 

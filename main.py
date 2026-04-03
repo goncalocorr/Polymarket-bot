@@ -18,6 +18,7 @@ from loguru import logger
 
 import config
 from ai.claude_analyst import ClaudeAnalyst
+from ai.openai_analyst import OpenAIAnalyst
 from core.bot import TradingBot
 from core.gamma_client import GammaClient
 from core.process_lock import SingleInstanceLock
@@ -37,6 +38,7 @@ from strategies.base import Signal
 from strategies.flash_crash import FlashCrashStrategy
 from strategies.mispricing import MispricingStrategy
 from strategies.multi_outcome import MultiOutcomeStrategy
+from strategies.reward_market_maker import RewardMarketMakerStrategy
 
 VERSION = "1.0.0"
 
@@ -53,6 +55,20 @@ if "PYTEST_CURRENT_TEST" not in os.environ and not any(
         level="DEBUG",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {module}:{line} | {message}",
     )
+
+
+def build_analyst():
+    """Build the configured AI analyst provider."""
+    provider = config.AI_PROVIDER
+
+    if provider == "openai":
+        return OpenAIAnalyst()
+    if provider == "anthropic":
+        return ClaudeAnalyst()
+
+    if config.OPENAI_API_KEY:
+        return OpenAIAnalyst()
+    return ClaudeAnalyst()
 
 
 class Orchestrator:
@@ -77,8 +93,24 @@ class Orchestrator:
         self.executor = ThreePhaseExecutor(self.bot)
         self.order_manager = OrderManager(self.bot, self.ws, self.executor)
 
+        # Wire partial exit persistence so DB stays in sync after partial fills
+        db_ref = self.db
+        risk_ref = self.risk_manager
+        def _persist_partial_exit(pos, fill_size, partial_pnl=0.0):
+            try:
+                db_ref.update_trade_size(pos.id, pos.size_usdc)
+            except Exception as e:
+                logger.error(f"Failed to persist partial exit for {pos.id}: {e}")
+            if partial_pnl != 0.0:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(risk_ref.record_trade_result(partial_pnl, close_reason="partial-exit"))
+                except RuntimeError:
+                    logger.warning(f"Could not record partial exit P&L for {pos.id}: no event loop")
+        self.order_manager._on_partial_exit = _persist_partial_exit
+
         # AI
-        self.analyst = ClaudeAnalyst()
+        self.analyst = build_analyst()
 
         # Strategies
         self.flash_crash = FlashCrashStrategy(
@@ -96,16 +128,26 @@ class Orchestrator:
             ws=self.ws,
             quality_scorer=self.quality_scorer,
         )
-        self.strategies = [
+        self.reward_market_maker = RewardMarketMakerStrategy(
+            self.gamma,
+            self.ws,
+            self.bot,
+            self.db,
+            self.risk_manager,
+            quality_scorer=self.quality_scorer,
+            order_manager=self.order_manager,
+        )
+        self.signal_strategies = [
             self.flash_crash, self.mispricing,
             self.ai_agent, self.multi_outcome,
         ]
+        self.strategies = self.signal_strategies + [self.reward_market_maker]
 
         # Strategy performance tracker
-        self.tracker = StrategyTracker(self.db, self.strategies)
+        self.tracker = StrategyTracker(self.db, self.signal_strategies)
 
         # Scanner
-        self.scanner = MarketScanner(self.strategies, scan_interval_s=30)
+        self.scanner = MarketScanner(self.signal_strategies, scan_interval_s=30)
 
         # Monitoring
         self.status_writer = StatusWriter(
@@ -124,6 +166,7 @@ class Orchestrator:
 
         self._running = False
         self._tasks = []
+        self._trade_lock = asyncio.Lock()  # Serialise exposure check + position open
         self._initial_capital = self.risk_manager.total_capital
         self._instance_lock = SingleInstanceLock(config.DATA_DIR / "bot.lock")
 
@@ -175,7 +218,10 @@ class Orchestrator:
     async def _finalize_closed_position(self, pos, reason: str = ""):
         """Apply accounting side-effects for a closed position."""
         close_reason = getattr(pos, "close_reason", "") or reason or pos.status
-        await self.risk_manager.record_trade_result(pos.pnl_usdc)
+        await self.risk_manager.record_trade_result(
+            pos.pnl_usdc,
+            close_reason=close_reason,
+        )
         self.db.close_trade(
             pos.id,
             pos.exit_price or 0,
@@ -257,79 +303,80 @@ class Orchestrator:
         group_id = signals[0].arb_group_id or "arb-unknown"
         logger.info(f"Processing arb group {group_id} with {len(signals)} legs")
 
-        planned: list[tuple[Signal, float]] = []
-        projected_exposure = self.order_manager.get_total_exposure()
-        reserved_tokens: set[str] = set()
+        async with self._trade_lock:
+            planned: list[tuple[Signal, float]] = []
+            projected_exposure = self.order_manager.get_total_exposure()
+            reserved_tokens: set[str] = set()
 
-        for signal in signals:
-            size_multiplier = self.tracker.get_size_multiplier(signal.strategy)
-            if size_multiplier <= 0:
-                logger.info(
-                    f"Arb group {group_id} blocked: strategy {signal.strategy} paused"
+            for signal in signals:
+                size_multiplier = self.tracker.get_size_multiplier(signal.strategy)
+                if size_multiplier <= 0:
+                    logger.info(
+                        f"Arb group {group_id} blocked: strategy {signal.strategy} paused"
+                    )
+                    return
+
+                has_existing_position = (
+                    self.order_manager.has_position_in_market(signal.token_id)
+                    or signal.token_id in reserved_tokens
                 )
-                return
 
-            has_existing_position = (
-                self.order_manager.has_position_in_market(signal.token_id)
-                or signal.token_id in reserved_tokens
-            )
-
-            allowed, size, reason = await self.risk_manager.validate_order(
-                signal,
-                current_exposure=projected_exposure,
-                has_existing_position=has_existing_position,
-            )
-            if not allowed:
-                logger.info(f"Arb group {group_id} blocked by risk manager: {reason}")
-                return
-
-            size *= size_multiplier
-            max_exposure = self.risk_manager.total_capital * config.MAX_TOTAL_EXPOSURE_PCT
-            max_position = self.risk_manager.total_capital * config.MAX_POSITION_SIZE_PCT
-            remaining_room = max_exposure - projected_exposure
-            size = min(size, max_position, remaining_room)
-            if size < config.MIN_ORDER_SIZE_USDC:
-                logger.info(
-                    f"Arb group {group_id} blocked: leg size ${size:.2f} "
-                    "below minimum after cap"
+                allowed, size, reason = await self.risk_manager.validate_order(
+                    signal,
+                    current_exposure=projected_exposure,
+                    has_existing_position=has_existing_position,
                 )
-                return
+                if not allowed:
+                    logger.info(f"Arb group {group_id} blocked by risk manager: {reason}")
+                    return
 
-            planned.append((signal, size))
-            projected_exposure += size
-            reserved_tokens.add(signal.token_id)
+                size *= size_multiplier
+                max_exposure = self.risk_manager.total_capital * config.MAX_TOTAL_EXPOSURE_PCT
+                max_position = self.risk_manager.total_capital * config.MAX_POSITION_SIZE_PCT
+                remaining_room = max_exposure - projected_exposure
+                size = min(size, max_position, remaining_room)
+                if size < config.MIN_ORDER_SIZE_USDC:
+                    logger.info(
+                        f"Arb group {group_id} blocked: leg size ${size:.2f} "
+                        "below minimum after cap"
+                    )
+                    return
 
-        opened_positions = []
-        for signal, size in planned:
-            position = await self.order_manager.open_position(
-                token_id=signal.token_id,
-                market_question=signal.market_question,
-                strategy=signal.strategy,
-                side=signal.side,
-                price=signal.price,
-                size_usdc=size,
-                take_profit=signal.take_profit,
-                stop_loss=signal.stop_loss,
-            )
+                planned.append((signal, size))
+                projected_exposure += size
+                reserved_tokens.add(signal.token_id)
 
-            if not position:
-                logger.error(
-                    f"Arb group {group_id} failed while opening "
-                    f"token {signal.token_id[:16]}..."
+            opened_positions = []
+            for signal, size in planned:
+                position = await self.order_manager.open_position(
+                    token_id=signal.token_id,
+                    market_question=signal.market_question,
+                    strategy=signal.strategy,
+                    side=signal.side,
+                    price=signal.price,
+                    size_usdc=size,
+                    take_profit=signal.take_profit,
+                    stop_loss=signal.stop_loss,
                 )
-                await self._rollback_arb_group(opened_positions, group_id)
-                return
 
-            opened_positions.append(position)
-            try:
-                await self._save_open_position(position)
-            except Exception as e:
-                logger.error(
-                    f"Arb group {group_id} failed while persisting "
-                    f"position {position.id}: {e}"
-                )
-                await self._rollback_arb_group(opened_positions, group_id)
-                return
+                if not position:
+                    logger.error(
+                        f"Arb group {group_id} failed while opening "
+                        f"token {signal.token_id[:16]}..."
+                    )
+                    await self._rollback_arb_group(opened_positions, group_id)
+                    return
+
+                opened_positions.append(position)
+                try:
+                    await self._save_open_position(position)
+                except Exception as e:
+                    logger.error(
+                        f"Arb group {group_id} failed while persisting "
+                        f"position {position.id}: {e}"
+                    )
+                    await self._rollback_arb_group(opened_positions, group_id)
+                    return
 
         for pos in opened_positions:
             try:
@@ -353,6 +400,14 @@ class Orchestrator:
 
     async def process_signal(self, signal: Signal):
         """Process a trading signal through risk validation and execution."""
+        # Discard stale signals whose price snapshot is too old
+        signal_age = (datetime.now(timezone.utc) - signal.timestamp).total_seconds()
+        if signal_age > config.STRATEGY_EVALUATION_TIMEOUT_S * 2:
+            logger.debug(
+                f"Signal discarded: {signal.strategy} signal is {signal_age:.0f}s old"
+            )
+            return
+
         # Strategy tracker gate — check if strategy is auto-paused or boosted
         size_multiplier = self.tracker.get_size_multiplier(signal.strategy)
         if size_multiplier <= 0:
@@ -361,40 +416,41 @@ class Orchestrator:
             )
             return
 
-        # Risk check
-        allowed, size, reason = await self.risk_manager.validate_order(
-            signal,
-            current_exposure=self.order_manager.get_total_exposure(),
-            has_existing_position=self.order_manager.has_position_in_market(
-                signal.token_id
-            ),
-        )
+        async with self._trade_lock:
+            # Risk check (under lock to prevent TOCTOU with concurrent signals)
+            allowed, size, reason = await self.risk_manager.validate_order(
+                signal,
+                current_exposure=self.order_manager.get_total_exposure(),
+                has_existing_position=self.order_manager.has_position_in_market(
+                    signal.token_id
+                ),
+            )
 
-        if not allowed:
-            logger.info(f"Signal blocked by risk manager: {reason}")
-            return
+            if not allowed:
+                logger.info(f"Signal blocked by risk manager: {reason}")
+                return
 
-        # Apply strategy boost/reduction, but re-cap to risk limits
-        size *= size_multiplier
-        max_exposure = self.risk_manager.total_capital * config.MAX_TOTAL_EXPOSURE_PCT
-        max_position = self.risk_manager.total_capital * config.MAX_POSITION_SIZE_PCT
-        remaining_room = max_exposure - self.order_manager.get_total_exposure()
-        size = min(size, max_position, remaining_room)
-        if size < config.MIN_ORDER_SIZE_USDC:
-            logger.info(f"Boosted size ${size:.2f} below minimum after cap")
-            return
+            # Apply strategy boost/reduction, but re-cap to risk limits
+            size *= size_multiplier
+            max_exposure = self.risk_manager.total_capital * config.MAX_TOTAL_EXPOSURE_PCT
+            max_position = self.risk_manager.total_capital * config.MAX_POSITION_SIZE_PCT
+            remaining_room = max_exposure - self.order_manager.get_total_exposure()
+            size = min(size, max_position, remaining_room)
+            if size < config.MIN_ORDER_SIZE_USDC:
+                logger.info(f"Boosted size ${size:.2f} below minimum after cap")
+                return
 
-        # Execute
-        position = await self.order_manager.open_position(
-            token_id=signal.token_id,
-            market_question=signal.market_question,
-            strategy=signal.strategy,
-            side=signal.side,
-            price=signal.price,
-            size_usdc=size,
-            take_profit=signal.take_profit,
-            stop_loss=signal.stop_loss,
-        )
+            # Execute (under lock so exposure is updated atomically)
+            position = await self.order_manager.open_position(
+                token_id=signal.token_id,
+                market_question=signal.market_question,
+                strategy=signal.strategy,
+                side=signal.side,
+                price=signal.price,
+                size_usdc=size,
+                take_profit=signal.take_profit,
+                stop_loss=signal.stop_loss,
+            )
 
         if position:
             try:
@@ -488,7 +544,7 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Daily report error: {e}")
 
-    def _restore_risk_state_from_db(self):
+    async def _restore_risk_state_from_db(self):
         """Rebuild risk state from persisted closed trades after a restart."""
         today_pnl = self.db.get_today_pnl()
 
@@ -499,12 +555,17 @@ class Orchestrator:
 
         circuit_breaker_until = None
         recent_trades = self.db.get_recent_trades(
-            config.CIRCUIT_BREAKER_CONSECUTIVE_LOSSES
+            config.CIRCUIT_BREAKER_CONSECUTIVE_LOSSES + 2
         )
         recent_losses = []
         for trade in recent_trades:
             pnl = float(trade.get("pnl_usdc", 0) or 0)
-            if pnl >= 0:
+            close_reason = str(trade.get("close_reason", "") or "")
+            # Skip time-stop exits in dry-run (not real losses)
+            if config.DRY_RUN and close_reason == "time-stop":
+                continue
+            # Breakeven (pnl == 0) shouldn't interrupt a losing streak
+            if pnl > 0:
                 break
             closed_at = trade.get("closed_at")
             if not closed_at:
@@ -523,7 +584,7 @@ class Orchestrator:
             if candidate_until > datetime.now(timezone.utc):
                 circuit_breaker_until = candidate_until
 
-        self.risk_manager.restore_state(
+        await self.risk_manager.restore_state(
             total_capital=total_capital,
             daily_pnl=today_pnl,
             circuit_breaker_until=circuit_breaker_until,
@@ -579,7 +640,7 @@ class Orchestrator:
             await self.risk_manager.update_capital(balance)
             logger.info(f"Balance: ${balance:.2f} USDC")
 
-        self._restore_risk_state_from_db()
+        await self._restore_risk_state_from_db()
 
         # Restore open positions from database (survive restarts)
         open_trades = self.db.get_open_trades()
@@ -597,6 +658,9 @@ class Orchestrator:
         await self.mispricing.initialize()
         await self.ai_agent.initialize()
         await self.multi_outcome.initialize()
+        reward_market_maker = getattr(self, "reward_market_maker", None)
+        if reward_market_maker:
+            await reward_market_maker.initialize()
         await self.mispricing.restore_runtime_state(
             self.order_manager.get_open_positions(),
             self.db.get_recent_trades(50),
@@ -627,6 +691,8 @@ class Orchestrator:
             asyncio.create_task(self.check_exits_loop()),
             asyncio.create_task(self.status_writer.run()),
         ]
+        if reward_market_maker:
+            self._tasks.append(asyncio.create_task(reward_market_maker.run()))
 
         # Only run TUI if we have a terminal
         if sys.stdout.isatty():
@@ -695,10 +761,27 @@ async def main():
     except KeyboardInterrupt:
         await orchestrator.stop()
     except Exception as e:
+        # Redact secrets BEFORE logging to prevent leaking keys to disk
+        raw_trace = traceback.format_exc()
+        safe_trace = raw_trace
+        for secret in (
+            config.POLYGON_WALLET_PRIVATE_KEY,
+            config.POLY_API_SECRET,
+            config.POLY_API_KEY,
+            config.POLY_API_PASSPHRASE,
+            config.POLY_BUILDER_API_SECRET,
+            config.ANTHROPIC_API_KEY,
+            config.OPENAI_API_KEY,
+            config.KALSHI_API_SECRET,
+            config.TELEGRAM_BOT_TOKEN,
+            config.NEWSAPI_KEY,
+        ):
+            if secret:
+                safe_trace = safe_trace.replace(secret, "[REDACTED]")
         logger.critical(f"Fatal error: {e}")
-        logger.critical(traceback.format_exc())
+        logger.critical(safe_trace)
         await orchestrator.telegram.critical_error(
-            type(e).__name__, traceback.format_exc()[-500:]
+            type(e).__name__, safe_trace[-500:]
         )
         await orchestrator.stop()
         sys.exit(1)

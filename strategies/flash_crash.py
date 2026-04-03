@@ -44,8 +44,8 @@ class FlashCrashStrategy(BaseStrategy):
 
         # token_id -> market metadata
         self._tracked_markets: dict[str, dict] = {}
-        # token_id -> True if we already signalled (avoid duplicates per market)
-        self._signalled: dict[str, bool] = {}
+        # token_id -> timestamp when signalled (expires after lookback window)
+        self._signalled: dict[str, datetime] = {}
 
     async def initialize(self):
         """Discover 15-min crypto markets and subscribe to their order books."""
@@ -80,9 +80,12 @@ class FlashCrashStrategy(BaseStrategy):
         signals = []
 
         for token_id, meta in self._tracked_markets.items():
-            # Skip if already signalled for this market
-            if self._signalled.get(token_id):
-                continue
+            # Skip if recently signalled (expires after 2x lookback window)
+            signalled_at = self._signalled.get(token_id)
+            if signalled_at is not None:
+                if (datetime.now(timezone.utc) - signalled_at).total_seconds() < self.lookback_seconds * 2:
+                    continue
+                del self._signalled[token_id]
 
             drop = self.ws.get_price_drop(token_id, self.lookback_seconds)
             if drop is None:
@@ -134,7 +137,7 @@ class FlashCrashStrategy(BaseStrategy):
                     ),
                 )
                 signals.append(signal)
-                self._signalled[token_id] = True
+                self._signalled[token_id] = datetime.now(timezone.utc)
 
         return signals
 

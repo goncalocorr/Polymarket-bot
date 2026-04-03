@@ -91,6 +91,20 @@ class TestRiskManagerTradeRecording:
         assert rm._circuit_breaker_until is not None
 
     @pytest.mark.asyncio
+    async def test_time_stop_loss_does_not_trigger_circuit_breaker_in_dry_run(self, rm):
+        with patch("config.DRY_RUN", True):
+            for _ in range(3):
+                await rm.record_trade_result(-5.0, close_reason="time-stop")
+        assert rm._circuit_breaker_until is None
+
+    @pytest.mark.asyncio
+    async def test_time_stop_loss_still_triggers_circuit_breaker_in_live(self, rm):
+        with patch("config.DRY_RUN", False):
+            for _ in range(3):
+                await rm.record_trade_result(-5.0, close_reason="time-stop")
+        assert rm._circuit_breaker_until is not None
+
+    @pytest.mark.asyncio
     async def test_win_resets_consecutive_losses(self, rm):
         await rm.record_trade_result(-5.0)
         await rm.record_trade_result(-5.0)
@@ -125,15 +139,17 @@ class TestRiskManagerStatus:
 
 
 class TestRiskManagerRestore:
-    def test_restore_state_recovers_daily_stop(self, rm):
-        rm.restore_state(total_capital=473.36, daily_pnl=-26.64)
+    @pytest.mark.asyncio
+    async def test_restore_state_recovers_daily_stop(self, rm):
+        await rm.restore_state(total_capital=473.36, daily_pnl=-26.64)
         assert rm.status == "STOPPED"
         assert rm.total_capital == 473.36
         assert rm.daily_pnl == -26.64
 
-    def test_restore_state_recovers_circuit_breaker(self, rm):
+    @pytest.mark.asyncio
+    async def test_restore_state_recovers_circuit_breaker(self, rm):
         until = datetime.now(timezone.utc) + timedelta(minutes=30)
-        rm.restore_state(
+        await rm.restore_state(
             total_capital=500.0,
             daily_pnl=-10.0,
             circuit_breaker_until=until,

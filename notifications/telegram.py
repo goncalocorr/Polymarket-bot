@@ -3,6 +3,7 @@ Telegram notifications for bot events.
 """
 
 import asyncio
+import html as html_mod
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -70,9 +71,10 @@ class TelegramNotifier:
     async def position_opened(
         self, question: str, side: str, price: float, size: float, strategy: str
     ):
+        safe_q = html_mod.escape(question[:100])
         await self.send(
             f"📈 <b>Position Opened</b>\n"
-            f"Market: {question[:100]}\n"
+            f"Market: {safe_q}\n"
             f"Side: <code>{side}</code>\n"
             f"Price: <code>{price:.4f}</code>\n"
             f"Size: <code>${size:.2f}</code>\n"
@@ -82,12 +84,14 @@ class TelegramNotifier:
     async def position_closed(
         self, question: str, pnl: float, pnl_pct: float, reason: str = ""
     ):
+        safe_q = html_mod.escape(question[:100])
+        safe_reason = html_mod.escape(reason or "manual")
         emoji = "✅" if pnl >= 0 else "❌"
         await self.send(
             f"{emoji} <b>Position Closed</b>\n"
-            f"Market: {question[:100]}\n"
+            f"Market: {safe_q}\n"
             f"P&L: <code>${pnl:+.2f}</code> ({pnl_pct:+.1f}%)\n"
-            f"Reason: {reason or 'manual'}"
+            f"Reason: {safe_reason}"
         )
 
     async def daily_stop_loss(self, total_loss: float, capital_remaining: float):
@@ -99,17 +103,20 @@ class TelegramNotifier:
         )
 
     async def circuit_breaker(self, reason: str, resume_time: str):
+        safe_reason = html_mod.escape(reason)
         await self.send(
             f"⚠️ <b>Circuit Breaker Activated</b>\n"
-            f"Reason: {reason}\n"
+            f"Reason: {safe_reason}\n"
             f"Resume: <code>{resume_time}</code>"
         )
 
     async def critical_error(self, error_type: str, trace: str):
+        safe_type = html_mod.escape(error_type)
+        safe_trace = html_mod.escape(trace[:500])
         await self.send(
             f"🔴 <b>Critical Error</b>\n"
-            f"Type: <code>{error_type}</code>\n"
-            f"<pre>{trace[:500]}</pre>"
+            f"Type: <code>{safe_type}</code>\n"
+            f"<pre>{safe_trace}</pre>"
         )
 
     async def daily_report(

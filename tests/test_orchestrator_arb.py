@@ -1,5 +1,6 @@
 """Tests for atomic multi-leg arbitrage execution in Orchestrator."""
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -80,6 +81,7 @@ def _mk_orchestrator_stub() -> Orchestrator:
         open_position=AsyncMock(),
         close_position=AsyncMock(),
     )
+    orch._trade_lock = asyncio.Lock()
 
     return orch
 

@@ -351,8 +351,8 @@ class TestMultiOutcomeArbitrage:
         assert len(signals2) == 0  # Already arbed
 
     @pytest.mark.asyncio
-    async def test_event_not_marked_until_execution_succeeds(self):
-        """A failed arb attempt should remain eligible on the next scan."""
+    async def test_event_marked_pending_suppresses_duplicate_signals(self):
+        """Once signals are emitted, the event is marked pending and not re-signalled."""
         events = [{
             "id": "evt_retry",
             "title": "Who wins?",
@@ -380,6 +380,42 @@ class TestMultiOutcomeArbitrage:
         signals2 = await strategy.evaluate()
 
         assert len(signals1) == 3
+        # Second scan should NOT re-emit: event is pending execution
+        assert len(signals2) == 0
+
+    @pytest.mark.asyncio
+    async def test_event_eligible_again_after_pending_cleared(self):
+        """If pending state is removed (e.g. failed execution), event is re-eligible."""
+        events = [{
+            "id": "evt_retry2",
+            "title": "Who wins?",
+            "markets": [
+                {
+                    "question": "A wins?",
+                    "outcomePrices": "0.20",
+                    "tokens": [{"token_id": "tok_a", "outcome": "Yes"}],
+                },
+                {
+                    "question": "B wins?",
+                    "outcomePrices": "0.20",
+                    "tokens": [{"token_id": "tok_b", "outcome": "Yes"}],
+                },
+                {
+                    "question": "C wins?",
+                    "outcomePrices": "0.20",
+                    "tokens": [{"token_id": "tok_c", "outcome": "Yes"}],
+                },
+            ],
+        }]
+        strategy = self._make_strategy(events=events)
+
+        signals1 = await strategy.evaluate()
+        assert len(signals1) == 3
+
+        # Simulate failed execution: remove pending mark
+        strategy._arbed_events.pop("evt_retry2", None)
+
+        signals2 = await strategy.evaluate()
         assert len(signals2) == 3
 
     @pytest.mark.asyncio

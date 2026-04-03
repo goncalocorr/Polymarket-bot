@@ -137,16 +137,25 @@ class TradingBot:
         Secret is base64-decoded before use.
         """
         headers: dict[str, str] = {}
+        # Single timestamp for both HMAC sections to ensure consistency
+        ts = str(int(time.time()))
 
         # Builder HMAC (for gasless/attributed orders)
         if self.builder_api_key and self.builder_api_secret:
-            ts = str(int(time.time()))
             message = f"{ts}{method}{path}{body}"
-            sig = hmac_mod.new(
-                self.builder_api_secret.encode(),
-                message.encode(),
-                hashlib.sha256,
-            ).hexdigest()
+            try:
+                decoded_secret = base64.urlsafe_b64decode(self.builder_api_secret)
+                h = hmac_mod.new(decoded_secret, message.encode("utf-8"), hashlib.sha256)
+                sig = base64.urlsafe_b64encode(h.digest()).decode("utf-8")
+            except Exception:
+                logger.warning(
+                    "Builder API secret is not valid base64 — falling back to raw key"
+                )
+                sig = hmac_mod.new(
+                    self.builder_api_secret.encode(),
+                    message.encode(),
+                    hashlib.sha256,
+                ).hexdigest()
             headers.update({
                 "POLY_BUILDER_API_KEY": self.builder_api_key,
                 "POLY_BUILDER_TIMESTAMP": ts,
@@ -156,7 +165,6 @@ class TradingBot:
 
         # L2 user HMAC (for authenticated data endpoints)
         if self.api_creds and self.api_creds.is_valid():
-            ts = str(int(time.time()))
             message = f"{ts}{method}{path}"
             if body:
                 message += body
@@ -165,7 +173,11 @@ class TradingBot:
                 decoded_secret = base64.urlsafe_b64decode(self.api_creds.secret)
                 h = hmac_mod.new(decoded_secret, message.encode("utf-8"), hashlib.sha256)
                 sig = base64.urlsafe_b64encode(h.digest()).decode("utf-8")
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    f"L2 API secret is not valid base64 ({exc!r}) — "
+                    "falling back to raw key; authenticated requests may fail"
+                )
                 sig = hmac_mod.new(
                     self.api_creds.secret.encode(),
                     message.encode(),
@@ -199,8 +211,8 @@ class TradingBot:
             return None
 
         # Convert price/size to maker/taker amounts (6 decimal USDC)
-        price_raw = int(price * 1e6)
-        size_raw = int(size * 1e6)
+        price_raw = round(price * 1e6)
+        size_raw = round(size * 1e6)
 
         if side == self.SIDE_BUY:
             maker_amount = size_raw  # USDC to spend
@@ -214,7 +226,7 @@ class TradingBot:
             "maker": self.address,
             "signer": self.address,
             "taker": "0x0000000000000000000000000000000000000000",
-            "tokenId": token_id_int,
+            "tokenId": str(token_id_int),
             "makerAmount": maker_amount,
             "takerAmount": taker_amount,
             "expiration": expiration,
@@ -232,6 +244,7 @@ class TradingBot:
         size: float,
         side: str,
         expiration: int = 0,
+        order_type: str = "GTC",
     ) -> Optional[dict]:
         """
         Place an order on the Polymarket CLOB.
@@ -258,6 +271,7 @@ class TradingBot:
                 "price": price,
                 "size": size,
                 "token_id": token_id,
+                "orderType": order_type,
             }
 
         side_int = self.SIDE_BUY if side.upper() == "BUY" else self.SIDE_SELL
@@ -270,7 +284,7 @@ class TradingBot:
             "order": order,
             "signature": signature,
             "owner": self.address,
-            "orderType": "GTC",
+            "orderType": order_type,
         }
 
         body_json = json.dumps(payload, separators=(",", ":"))
@@ -291,6 +305,53 @@ class TradingBot:
         except httpx.HTTPError as e:
             logger.error(f"Failed to place order: {e}")
             return None
+
+    async def get_order_scoring(self, order_id: str) -> dict:
+        """Check whether an order is currently scoring for liquidity rewards."""
+        if config.DRY_RUN:
+            return {"scoring": True}
+
+        endpoint = "/order-scoring"
+        hmac_headers = self._build_hmac_headers("GET", endpoint)
+        client = await self._get_client()
+        try:
+            resp = await client.get(
+                endpoint,
+                params={"orderId": order_id},
+                headers=hmac_headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else {"scoring": bool(data)}
+        except httpx.HTTPError as e:
+            logger.debug(f"Failed to get order scoring for {order_id}: {e}")
+            return {"scoring": False}
+
+    async def get_orders_scoring(self, order_ids: list[str]) -> dict[str, bool]:
+        """Check whether multiple orders are scoring for rewards."""
+        if not order_ids:
+            return {}
+        if config.DRY_RUN:
+            return {order_id: True for order_id in order_ids}
+
+        endpoint = "/orders-scoring"
+        body = {"orderIds": order_ids}
+        body_json = json.dumps(body, separators=(",", ":"))
+        hmac_headers = self._build_hmac_headers("POST", endpoint, body_json)
+        client = await self._get_client()
+        try:
+            resp = await client.post(
+                endpoint,
+                content=body_json,
+                headers=hmac_headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                return {str(k): bool(v) for k, v in data.items()}
+        except httpx.HTTPError as e:
+            logger.debug(f"Failed to get order scoring batch: {e}")
+        return {order_id: False for order_id in order_ids}
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order by ID."""
@@ -316,6 +377,10 @@ class TradingBot:
 
     async def cancel_all_orders(self) -> int:
         """Cancel all open orders. Returns number cancelled."""
+        if config.DRY_RUN:
+            logger.info("[DRY RUN] Would cancel all open orders")
+            return 0
+
         orders = await self.get_open_orders()
         cancelled = 0
         for order in orders:

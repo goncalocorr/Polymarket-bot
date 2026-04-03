@@ -134,6 +134,16 @@ class MultiOutcomeStrategy(BaseStrategy):
             if not outcome_data or len(outcome_data) < self.min_outcomes:
                 continue
 
+            # Safety: if any market was filtered out (near-resolved), skip the
+            # entire event — buying a subset is NOT a guaranteed arbitrage.
+            if len(outcome_data) != len(markets):
+                logger.debug(
+                    f"MultiOutcome: Skipping '{event_title}' — "
+                    f"{len(markets) - len(outcome_data)} outcomes filtered "
+                    "(near-resolved); partial arb is unsafe"
+                )
+                continue
+
             price_sum = sum(o["price"] for o in outcome_data)
 
             if price_sum <= 0 or price_sum >= self.max_sum:
@@ -144,10 +154,11 @@ class MultiOutcomeStrategy(BaseStrategy):
 
             # We have an arbitrage opportunity!
             spread = 1.0 - price_sum
+            actual_profit = self.size_usdc * spread / price_sum
             logger.warning(
                 f"MultiOutcome ARB FOUND: '{event_title}' — "
                 f"{len(outcome_data)} outcomes, sum={price_sum:.4f}, "
-                f"spread={spread:.4f} (${spread * self.size_usdc:.2f} profit)"
+                f"spread={spread:.4f} (${actual_profit:.2f} profit)"
             )
 
             # Tag all legs with a shared group ID so the orchestrator
@@ -185,6 +196,8 @@ class MultiOutcomeStrategy(BaseStrategy):
 
             # Only emit signals if we have legs for ALL outcomes
             if len(event_signals) == len(outcome_data):
+                # Mark as pending to prevent re-signalling on next cycle
+                self._arbed_events[event_id] = False  # False = pending, not yet executed
                 signals.extend(event_signals)
             else:
                 logger.warning(
@@ -225,7 +238,9 @@ class MultiOutcomeStrategy(BaseStrategy):
 
         for m in markets:
             question = m.get("question", "")
-            price = _parse_outcome_price(m.get("outcomePrices"))
+            price = _parse_outcome_price(m.get("outcomePrices"), default=None)
+            if price is None:
+                continue
 
             # Skip markets with extreme prices (practically resolved)
             if price <= 0.02 or price >= 0.98:

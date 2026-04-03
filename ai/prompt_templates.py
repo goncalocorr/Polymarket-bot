@@ -17,6 +17,18 @@ Your methodology:
 6. Check for anchoring bias: is the current market price pulling your estimate?"""
 
 
+def _sanitize_external(text: str, max_len: int = 200, allow_newlines: bool = False) -> str:
+    """Strip control characters, XML tags, and truncate external data to prevent prompt injection."""
+    import re
+    if allow_newlines:
+        cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    else:
+        cleaned = text.replace("\r", " ").replace("\n", " ").strip()
+    # Remove angle brackets to prevent XML tag injection in structured prompts
+    cleaned = re.sub(r"[<>]", "", cleaned)
+    return cleaned[:max_len]
+
+
 def superforecaster_prompt(
     question: str,
     price: float,
@@ -29,16 +41,23 @@ def superforecaster_prompt(
     Build a structured superforecaster analysis prompt.
     Returns the user message; pair with SYSTEM_SUPERFORECASTER as system prompt.
     """
+    safe_question = _sanitize_external(question, max_len=200)
+    safe_end_date = _sanitize_external(end_date, max_len=30)
+    safe_external = _sanitize_external(external_info, max_len=500, allow_newlines=True)
+    safe_news = _sanitize_external(news_section, max_len=500, allow_newlines=True)
+
     return f"""Analyse this prediction market using the superforecaster methodology.
 
-Market question: {question}
+<market_data>
+Market question: {safe_question}
 Current Polymarket price: {price:.4f} (implies {price * 100:.1f}% probability)
 24h volume: ${volume:,.0f}
-Resolution date: {end_date}
+Resolution date: {safe_end_date}
 
-{external_info}
+{safe_external}
 
-{news_section}
+{safe_news}
+</market_data>
 
 Follow these steps in your reasoning (think step-by-step internally, but only output JSON):
 

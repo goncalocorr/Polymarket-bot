@@ -1,12 +1,7 @@
-"""
-Market analysis via Anthropic Claude API.
-Adapted from Polymarket/agents, replacing OpenAI with Claude.
-Uses superforecaster prompt methodology for structured reasoning.
-"""
+"""Market analysis via Anthropic Claude API."""
 
 import asyncio
 import json
-import re
 from typing import Optional
 
 import anthropic
@@ -14,6 +9,7 @@ from loguru import logger
 
 import config
 from ai.prompt_templates import SYSTEM_SUPERFORECASTER, superforecaster_prompt
+from ai.response_utils import parse_analysis_json
 
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2.0
@@ -24,6 +20,9 @@ class ClaudeAnalyst:
     Uses Claude to estimate the true probability of a market event
     given current prices, external data, and recent news.
     """
+
+    provider_name = "anthropic"
+    required_api_key_env = "ANTHROPIC_API_KEY"
 
     def __init__(self, api_key: str = "", model: str = ""):
         self.api_key = api_key or config.ANTHROPIC_API_KEY
@@ -38,20 +37,16 @@ class ClaudeAnalyst:
     async def analyse_market(
         self, market_data: dict, recent_news: list[str]
     ) -> dict:
-        """
-        Ask Claude to estimate the true probability of a market event.
+        """Ask Claude to estimate the true probability of a market event."""
+        question = market_data.get("question", "")
+        price = market_data.get("price", 0.5)
+        if not question:
+            return {"probability": 0.5, "confidence": 0.0, "reasoning": "Missing market question"}
 
-        Args:
-            market_data: Dict with question, price, volume, end_date, external_prices.
-            recent_news: List of recent news headlines.
-
-        Returns:
-            Dict with probability, confidence, reasoning.
-        """
         external_info = ""
         ext_prices = market_data.get("external_prices", {})
         if ext_prices:
-            lines = [f"  - {k}: {v:.2f}" for k, v in ext_prices.items()]
+            lines = [f"  - {k}: {v:.2f}" for k, v in ext_prices.items() if isinstance(v, (int, float))]
             external_info = "External platform probabilities:\n" + "\n".join(lines)
 
         news_section = ""
@@ -61,8 +56,8 @@ class ClaudeAnalyst:
             )
 
         prompt = superforecaster_prompt(
-            question=market_data["question"],
-            price=market_data["price"],
+            question=question,
+            price=price,
             volume=market_data.get("volume", 0),
             end_date=market_data.get("end_date", "Unknown"),
             external_info=external_info,
@@ -70,7 +65,6 @@ class ClaudeAnalyst:
         )
 
         text = ""
-        last_error: Optional[Exception] = None
         for attempt in range(MAX_RETRIES):
             try:
                 client = self._get_client()
@@ -83,24 +77,26 @@ class ClaudeAnalyst:
 
                 if not response.content:
                     logger.error("Claude returned empty content")
-                    return {"probability": 0.5, "confidence": 0.0, "reasoning": "Empty response"}
+                    return {
+                        "probability": 0.5,
+                        "confidence": 0.0,
+                        "reasoning": "Empty response",
+                    }
 
                 text = response.content[0].text.strip()
-                break  # Success — exit retry loop
+                break
 
             except anthropic.APIConnectionError as e:
-                last_error = e
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_BASE_DELAY * (2 ** attempt)
                     logger.warning(
                         f"Claude API connection error (attempt {attempt + 1}/{MAX_RETRIES}): "
-                        f"{e} — retrying in {delay:.0f}s"
+                        f"{e} - retrying in {delay:.0f}s"
                     )
                     await asyncio.sleep(delay)
                     continue
                 raise
             except anthropic.RateLimitError as e:
-                last_error = e
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_BASE_DELAY * (2 ** attempt)
                     logger.warning(
@@ -111,36 +107,19 @@ class ClaudeAnalyst:
                     continue
                 raise
             except anthropic.APIError as e:
-                # Non-retryable API errors (auth, bad request, etc.)
                 logger.error(f"Claude API error: {e}")
                 raise
 
-        # Parse response
         try:
-            # Extract JSON from markdown code blocks (handles multiple blocks)
-            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-            if match:
-                text = match.group(1).strip()
-            elif text.startswith("```"):
-                # Fallback for unclosed code blocks
-                text = re.sub(r"^```(?:json)?\s*", "", text)
-                text = re.sub(r"\s*```$", "", text).strip()
-
-            result = json.loads(text)
-
-            # Validate response
-            result["probability"] = max(0.0, min(1.0, float(result.get("probability", 0.5))))
-            result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
-            result["reasoning"] = str(result.get("reasoning", ""))
-
-            q = market_data['question']
+            result = parse_analysis_json(text)
+            q = question
             q_display = q[:50] + ("..." if len(q) > 50 else "")
             logger.debug(
                 f"Claude analysis: prob={result['probability']:.2f}, "
                 f"conf={result['confidence']:.2f} for '{q_display}'"
             )
             return result
-
         except json.JSONDecodeError as e:
             logger.error(f"Claude returned invalid JSON: {e}. Raw: {text[:200]!r}")
             return {"probability": 0.5, "confidence": 0.0, "reasoning": "Parse error"}
+

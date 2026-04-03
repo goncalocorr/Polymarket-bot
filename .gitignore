@@ -24,6 +24,7 @@ env/
 *.swo
 
 # Data
+data/**/*.db
 data/*.db
 data/*.parquet
 data/archive/
@@ -44,6 +45,15 @@ Thumbs.db
 
 # ChromaDB
 chroma_data/
+
+# Reference repos (third-party code kept locally for study)
+discountry/
+jon-becker/
+polymarket-agents/
+
+# Test temp dirs
+.pytest_tmp/
+tmp_test/
 
 # Claude Code
 .claude/

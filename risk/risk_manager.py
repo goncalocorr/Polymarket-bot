@@ -23,7 +23,7 @@ class RiskManager:
     5. Position size > 10%? → reduce to fit
     """
 
-    def __init__(self, total_capital: float = 500.0):
+    def __init__(self, total_capital: float = config.TOTAL_CAPITAL):
         self.total_capital = total_capital
         self._daily_start_capital = total_capital
         self.daily_pnl = 0.0
@@ -62,7 +62,7 @@ class RiskManager:
         async with self._lock:
             self.total_capital = capital
 
-    def restore_state(
+    async def restore_state(
         self,
         total_capital: float,
         daily_pnl: float,
@@ -70,14 +70,15 @@ class RiskManager:
         circuit_breaker_until: Optional[datetime] = None,
     ):
         """Restore risk state after a restart from persisted trade history."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        self.total_capital = total_capital
-        self.daily_pnl = daily_pnl
-        self._last_reset_date = today
-        self._daily_start_capital = max(total_capital - daily_pnl, 0.01)
-        self._circuit_breaker_until = circuit_breaker_until
-        daily_loss_limit = self._daily_start_capital * config.DAILY_LOSS_LIMIT_PCT
-        self._daily_stop_triggered = daily_pnl <= -daily_loss_limit
+        async with self._lock:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            self.total_capital = total_capital
+            self.daily_pnl = daily_pnl
+            self._last_reset_date = today
+            self._daily_start_capital = max(total_capital - daily_pnl, 0.01)
+            self._circuit_breaker_until = circuit_breaker_until
+            daily_loss_limit = self._daily_start_capital * config.DAILY_LOSS_LIMIT_PCT
+            self._daily_stop_triggered = daily_pnl <= -daily_loss_limit
 
     def _reset_daily(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -87,14 +88,22 @@ class RiskManager:
             self._daily_stop_triggered = False
             self._last_reset_date = today
 
-    async def record_trade_result(self, pnl: float):
+    def _counts_toward_circuit_breaker(self, pnl: float, close_reason: str = "") -> bool:
+        """Whether a closed trade should count as a consecutive loss."""
+        if pnl >= 0:
+            return False
+        if config.DRY_RUN and close_reason == "time-stop":
+            return False
+        return True
+
+    async def record_trade_result(self, pnl: float, close_reason: str = ""):
         """Record a trade result and update risk state."""
         async with self._lock:
             self._reset_daily()
             self.daily_pnl += pnl
             self.total_capital += pnl
 
-            if pnl < 0:
+            if self._counts_toward_circuit_breaker(pnl, close_reason):
                 self._consecutive_losses += 1
             else:
                 self._consecutive_losses = 0
@@ -221,11 +230,7 @@ class RiskManager:
                 f"limit ${max_exposure:.2f}"
             )
 
-        estimated_prob = (
-            signal.estimated_prob
-            if signal.estimated_prob is not None
-            else signal.confidence
-        )
+        estimated_prob = signal.estimated_prob
 
         # 5. Position sizing ? Kelly or fixed
         if signal.estimated_prob is not None and signal.price > 0:
@@ -247,21 +252,22 @@ class RiskManager:
             size = self.total_capital * kelly_frac
             sizing_method = "kelly-estimated"
         elif (
-            signal.confidence >= config.KELLY_MIN_CONFIDENCE
+            estimated_prob is None
+            and signal.confidence >= config.KELLY_MIN_CONFIDENCE
             and signal.price > 0
         ):
-            # Check minimum edge first
-            edge = abs(estimated_prob - signal.price)
+            # No explicit estimated_prob — use confidence as a rough proxy.
+            # This is an approximation: confidence ≠ probability, but it's the
+            # best signal available when strategies don't provide estimated_prob.
+            proxy_prob = signal.confidence
+            edge = abs(proxy_prob - signal.price)
             if edge < config.MIN_KELLY_EDGE:
                 return False, 0, (
                     f"Edge {edge:.3f} below minimum {config.MIN_KELLY_EDGE}"
                 )
 
-            # Use Kelly Criterion
-            # estimated_prob = signal.confidence, confidence is already
-            # baked into KELLY_FRACTION (Half-Kelly), don't double-scale
             kelly_frac = self.kelly_size(
-                estimated_prob=estimated_prob,
+                estimated_prob=proxy_prob,
                 market_price=signal.price,
                 confidence=1.0,  # scaling handled by KELLY_FRACTION alone
             )
@@ -287,27 +293,34 @@ class RiskManager:
 
         return True, size, f"OK ({sizing_method})"
 
+    def _snapshot_state(self) -> tuple[bool, Optional[datetime]]:
+        """Snapshot volatile fields together to avoid torn reads."""
+        return self._daily_stop_triggered, self._circuit_breaker_until
+
     @property
     def status(self) -> str:
         """Current risk status string."""
-        if self._daily_stop_triggered:
+        stopped, cb_until = self._snapshot_state()
+        if stopped:
             return "STOPPED"
-        if self._circuit_breaker_until and datetime.now(timezone.utc) < self._circuit_breaker_until:
+        if cb_until and datetime.now(timezone.utc) < cb_until:
             return "PAUSED"
         return "RUNNING"
 
     @property
     def stop_reason(self) -> str:
         """Human-readable reason for the current non-running status."""
-        if self._daily_stop_triggered:
+        stopped, cb_until = self._snapshot_state()
+        if stopped:
             return "Daily stop-loss triggered"
-        if self._circuit_breaker_until and datetime.now(timezone.utc) < self._circuit_breaker_until:
+        if cb_until and datetime.now(timezone.utc) < cb_until:
             return "Circuit breaker active"
         return ""
 
     @property
     def resume_at(self) -> str:
         """UTC resume timestamp when a temporary pause is active."""
-        if self._circuit_breaker_until and datetime.now(timezone.utc) < self._circuit_breaker_until:
-            return self._circuit_breaker_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        _, cb_until = self._snapshot_state()
+        if cb_until and datetime.now(timezone.utc) < cb_until:
+            return cb_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         return ""

@@ -2,6 +2,7 @@
 Order lifecycle management — tracks open positions and manages exits.
 """
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from dateutil.parser import isoparse
@@ -73,6 +74,7 @@ class OrderManager:
         self.ws = ws
         self.executor = executor
         self.positions: dict[str, Position] = {}  # id -> Position
+        self._lock = asyncio.Lock()
 
     def load_open_positions(self, open_trades: list[dict]):
         """Restore open positions from database rows after a restart."""
@@ -120,7 +122,11 @@ class OrderManager:
         take_profit: Optional[float] = None,
         stop_loss: Optional[float] = None,
     ) -> Optional[Position]:
-        """Open a new position via the three-phase executor."""
+        """Open a new position via the three-phase executor.
+
+        The executor call runs outside _lock to avoid blocking exit checks
+        for the full 45-95s execution duration. Only the dict mutation is locked.
+        """
         result = await self.executor.execute(token_id, price, size_usdc, side)
 
         if not result.filled and result.fill_size == 0:
@@ -141,7 +147,9 @@ class OrderManager:
             take_profit=take_profit,
             stop_loss=stop_loss,
         )
-        self.positions[pos.id] = pos
+        async with self._lock:
+            self.positions[pos.id] = pos
+
         logger.info(
             f"Position opened: {pos.id} — {side} {result.fill_size:.2f} USDC "
             f"at {result.fill_price:.4f} [{strategy}] "
@@ -153,12 +161,13 @@ class OrderManager:
         self, position_id: str, reason: str = ""
     ) -> Optional[Position]:
         """Close an open position."""
-        pos = self.positions.get(position_id)
-        if not pos or not pos.is_open:
-            return None
+        async with self._lock:
+            pos = self.positions.get(position_id)
+            if not pos or not pos.is_open:
+                return None
 
-        # Prevent re-entry: mark as CLOSING before any async work
-        pos.status = "CLOSING"
+            # Prevent re-entry: mark as CLOSING before any async work
+            pos.status = "CLOSING"
 
         current_price = self.ws.get_mid_price(pos.token_id)
         if current_price is None:
@@ -175,24 +184,39 @@ class OrderManager:
                 f"Exit FAILED for {pos.id} ({reason or 'manual'}) — "
                 f"position remains OPEN. Error: {result.error}"
             )
-            pos.status = "OPEN"  # Revert from CLOSING
+            async with self._lock:
+                pos.status = "OPEN"  # Revert from CLOSING under lock
             return None
 
         # Partial exit: reduce position size, keep OPEN for remainder
         if result.fill_size < pos.size_usdc * 0.95 and not result.filled:
+            # Compute realized P&L on the partial fill
+            exit_price = result.fill_price if result.fill_price > 0 else current_price
+            if pos.side == "BUY" and pos.entry_price > 0:
+                partial_shares = result.fill_size / pos.entry_price
+                partial_pnl = partial_shares * (exit_price - pos.entry_price)
+            elif pos.side != "BUY" and (1 - pos.entry_price) > 0:
+                partial_shares = result.fill_size / (1 - pos.entry_price)
+                partial_pnl = partial_shares * (pos.entry_price - exit_price)
+            else:
+                partial_pnl = 0.0
             logger.warning(
-                f"Partial exit for {pos.id}: {result.fill_size:.2f}/{pos.size_usdc:.2f} — "
-                f"position remains OPEN for remainder"
+                f"Partial exit for {pos.id}: {result.fill_size:.2f}/{pos.size_usdc:.2f} "
+                f"(partial P&L: ${partial_pnl:+.2f}) — position remains OPEN for remainder"
             )
-            pos.size_usdc -= result.fill_size
-            pos.status = "OPEN"  # Revert from CLOSING
+            async with self._lock:
+                pos.size_usdc -= result.fill_size
+                pos.status = "OPEN"  # Revert from CLOSING under lock
+            # Persist reduced size to DB so restarts reflect partial exit
+            self._on_partial_exit(pos, result.fill_size, partial_pnl)
             return None
 
-        pos.exit_price = result.fill_price if result.filled else current_price
-        pos.close_reason = reason or "manual"
-        pos.pnl_usdc = pos.current_pnl(pos.exit_price)
-        pos.closed_at = datetime.now(timezone.utc)
-        pos.status = "CLOSED"
+        async with self._lock:
+            pos.exit_price = result.fill_price if result.filled else current_price
+            pos.close_reason = reason or "manual"
+            pos.pnl_usdc = pos.current_pnl(pos.exit_price)
+            pos.closed_at = datetime.now(timezone.utc)
+            pos.status = "CLOSED"
 
         logger.info(
             f"Position closed: {pos.id} — P&L: ${pos.pnl_usdc:+.2f} "
@@ -200,12 +224,21 @@ class OrderManager:
         )
         return pos
 
+    def _on_partial_exit(self, pos: Position, fill_size: float, partial_pnl: float = 0.0):
+        """Hook for subclasses/callers to persist partial exit size changes."""
+        pass
+
     async def check_exits(self) -> list[Position]:
         """Check all open positions for take-profit / stop-loss conditions."""
         closed = []
         now = datetime.now(timezone.utc)
 
-        for pos in list(self.positions.values()):
+        # Snapshot candidates under lock to avoid TOCTOU with close_position
+        async with self._lock:
+            candidates = [p for p in self.positions.values() if p.is_open]
+
+        for pos in candidates:
+            # Re-check status: close_position may have set CLOSING between snapshot and here
             if not pos.is_open:
                 continue
 
@@ -259,18 +292,18 @@ class OrderManager:
                     closed.append(p)
 
         # Prune closed positions to prevent unbounded memory growth
-        closed_ids = [
-            pid for pid, p in self.positions.items()
-            if p.status in ("CLOSED", "STOPPED")
-        ]
-        if len(closed_ids) > 100:
-            # Sort by closed_at, remove oldest
-            closed_positions = sorted(
-                [(pid, self.positions[pid]) for pid in closed_ids],
-                key=lambda x: x[1].closed_at or datetime.min.replace(tzinfo=timezone.utc),
-            )
-            for pid, _ in closed_positions[:-50]:  # Keep last 50
-                del self.positions[pid]
+        async with self._lock:
+            closed_ids = [
+                pid for pid, p in self.positions.items()
+                if p.status in ("CLOSED", "STOPPED")
+            ]
+            if len(closed_ids) > 100:
+                closed_positions = sorted(
+                    [(pid, self.positions[pid]) for pid in closed_ids],
+                    key=lambda x: x[1].closed_at or datetime.min.replace(tzinfo=timezone.utc),
+                )
+                for pid, _ in closed_positions[:-50]:  # Keep last 50
+                    del self.positions[pid]
 
         return closed
 
@@ -285,8 +318,8 @@ class OrderManager:
         return sum(p.size_usdc for p in self.positions.values() if p.is_open)
 
     def has_position_in_market(self, token_id: str) -> bool:
-        """Check if we already have an open position for this token."""
+        """Check if we already have an open or closing position for this token."""
         return any(
-            p.token_id == token_id and p.is_open
+            p.token_id == token_id and p.status in ("OPEN", "CLOSING")
             for p in self.positions.values()
         )

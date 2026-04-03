@@ -243,6 +243,15 @@ class TestMispricingDetection:
 
         assert not strategy._in_reentry_cooldown("tok_yes")
 
+    def test_repeated_losses_trigger_strikeout_block(self, gamma, external):
+        strategy = MispricingStrategy(gamma, external)
+
+        strategy.record_closed_trade("tok_yes", -1.0, "time-stop")
+        strategy.record_closed_trade("tok_yes", -1.0, "time-stop")
+        strategy.record_closed_trade("tok_yes", -1.0, "time-stop")
+
+        assert strategy._in_strikeout_block("tok_yes")
+
     @pytest.mark.asyncio
     async def test_restore_runtime_state_subscribes_open_positions_and_backfills_exits(
         self, gamma, external
@@ -317,6 +326,74 @@ class TestMispricingDetection:
         assert strategy._in_reentry_cooldown("tok_yes")
 
     @pytest.mark.asyncio
+    async def test_restore_runtime_state_recovers_strikeout_block(
+        self, gamma, external
+    ):
+        strategy = MispricingStrategy(gamma, external)
+        now = datetime.now(timezone.utc)
+        recent_trades = [
+            {
+                "strategy": "mispricing",
+                "token_id": "tok_yes",
+                "pnl_usdc": -5.0,
+                "close_reason": "time-stop",
+                "closed_at": (now - timedelta(hours=1)).isoformat(),
+            },
+            {
+                "strategy": "mispricing",
+                "token_id": "tok_yes",
+                "pnl_usdc": -2.0,
+                "close_reason": "time-stop",
+                "closed_at": (now - timedelta(hours=2)).isoformat(),
+            },
+            {
+                "strategy": "mispricing",
+                "token_id": "tok_yes",
+                "pnl_usdc": -1.0,
+                "close_reason": "time-stop",
+                "closed_at": (now - timedelta(hours=3)).isoformat(),
+            },
+        ]
+
+        await strategy.restore_runtime_state([], recent_trades)
+
+        assert strategy._in_strikeout_block("tok_yes")
+
+    @pytest.mark.asyncio
+    async def test_restore_runtime_state_strikeout_uses_latest_loss_timestamp(
+        self, gamma, external
+    ):
+        strategy = MispricingStrategy(gamma, external)
+        now = datetime.now(timezone.utc)
+        recent_trades = [
+            {
+                "strategy": "mispricing",
+                "token_id": "tok_yes",
+                "pnl_usdc": -1.0,
+                "close_reason": "time-stop",
+                "closed_at": (now - timedelta(hours=1)).isoformat(),
+            },
+            {
+                "strategy": "mispricing",
+                "token_id": "tok_yes",
+                "pnl_usdc": -1.0,
+                "close_reason": "time-stop",
+                "closed_at": (now - timedelta(hours=2)).isoformat(),
+            },
+            {
+                "strategy": "mispricing",
+                "token_id": "tok_yes",
+                "pnl_usdc": -1.0,
+                "close_reason": "time-stop",
+                "closed_at": (now - timedelta(hours=23)).isoformat(),
+            },
+        ]
+
+        await strategy.restore_runtime_state([], recent_trades)
+
+        assert strategy._in_strikeout_block("tok_yes")
+
+    @pytest.mark.asyncio
     async def test_skips_signal_if_live_price_already_through_take_profit(
         self, gamma, external
     ):
@@ -341,6 +418,42 @@ class TestMispricingDetection:
             }
         ]
         external.find_matching_prices.return_value = {"kalshi": 1.0}
+
+        signals = await strategy.evaluate()
+
+        assert signals == []
+
+    @pytest.mark.asyncio
+    async def test_skips_signal_when_strikeout_block_is_active(
+        self, gamma, external
+    ):
+        ws = MagicMock()
+        ws.subscribe = AsyncMock()
+        ws.get_order_book = MagicMock(return_value={"bids": [], "asks": []})
+        ws.get_mid_price = MagicMock(return_value=0.44)
+        quality = MagicMock()
+        quality.is_tradeable.return_value = (
+            True,
+            MagicMock(total=0.8, is_tradeable=True),
+        )
+        strategy = MispricingStrategy(
+            gamma, external, ws=ws, quality_scorer=quality
+        )
+        gamma.get_markets_for_mispricing.return_value = [
+            {
+                "question": "Will event X happen?",
+                "outcomePrices": "[0.40]",
+                "volume24hr": 10000,
+                "tokens": ["tok_yes", "tok_no"],
+            }
+        ]
+        external.find_matching_prices.return_value = {
+            "kalshi": 0.55,
+            "metaculus": 0.52,
+        }
+        strategy.record_closed_trade("tok_yes", -1.0, "time-stop")
+        strategy.record_closed_trade("tok_yes", -1.0, "time-stop")
+        strategy.record_closed_trade("tok_yes", -1.0, "time-stop")
 
         signals = await strategy.evaluate()
 
