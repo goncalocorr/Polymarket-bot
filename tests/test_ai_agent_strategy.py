@@ -36,8 +36,9 @@ async def test_ai_agent_persists_daily_call_budget_across_restarts(monkeypatch):
         external.get_recent_news = AsyncMock(return_value=["Headline"])
 
         analyst = MagicMock()
-        analyst.analyse_market = AsyncMock(return_value={
-            "probability": 0.65,
+        analyst.classify_market = AsyncMock(return_value={
+            "direction": "BULLISH",
+            "materiality": 0.6,
             "confidence": 0.75,
             "reasoning": "Edge confirmed",
         })
@@ -49,14 +50,14 @@ async def test_ai_agent_persists_daily_call_budget_across_restarts(monkeypatch):
         signals = await strategy.evaluate()
 
         assert len(signals) == 1
-        assert analyst.analyse_market.await_count == 1
+        assert analyst.classify_market.await_count == 1
 
         restarted = AIAgentStrategy(gamma, external, analyst, db=db)
         await restarted.initialize()
         second_signals = await restarted.evaluate()
 
         assert second_signals == []
-        assert analyst.analyse_market.await_count == 1
+        assert analyst.classify_market.await_count == 1
     finally:
         Path(tmp.name).unlink(missing_ok=True)
 
@@ -77,7 +78,8 @@ async def test_ai_agent_disables_itself_without_api_key():
 
 
 @pytest.mark.asyncio
-async def test_ai_agent_signal_uses_claude_probability_for_estimated_prob():
+async def test_ai_agent_signal_uses_claude_probability_for_estimated_prob(monkeypatch):
+    monkeypatch.setattr("config.MAX_AI_CALLS_PER_DAY", 10)
     gamma = MagicMock()
     gamma.get_markets_for_mispricing = AsyncMock(return_value=[
         {
@@ -96,8 +98,9 @@ async def test_ai_agent_signal_uses_claude_probability_for_estimated_prob():
     external.get_recent_news = AsyncMock(return_value=["Headline"])
     analyst = MagicMock()
     analyst.api_key = "configured"
-    analyst.analyse_market = AsyncMock(return_value={
-        "probability": 0.68,
+    analyst.classify_market = AsyncMock(return_value={
+        "direction": "BULLISH",
+        "materiality": 0.6,
         "confidence": 0.75,
         "reasoning": "Edge confirmed",
     })
@@ -107,5 +110,6 @@ async def test_ai_agent_signal_uses_claude_probability_for_estimated_prob():
     signals = await strategy.evaluate()
 
     assert len(signals) == 1
-    assert signals[0].estimated_prob == pytest.approx(0.68)
+    # estimated_prob = price + materiality * (1 - price) = 0.50 + 0.6 * 0.50 = 0.80
+    assert signals[0].estimated_prob == pytest.approx(0.80)
     assert signals[0].confidence == pytest.approx(0.75)

@@ -312,12 +312,13 @@ class TestMispricingDetection:
         self, gamma, external
     ):
         strategy = MispricingStrategy(gamma, external)
+        # Use 1 minute ago — well within any reasonable cooldown setting
         recent_trade = {
             "strategy": "mispricing",
             "token_id": "tok_yes",
             "pnl_usdc": -5.0,
             "closed_at": (
-                datetime.now(timezone.utc) - timedelta(minutes=5)
+                datetime.now(timezone.utc) - timedelta(minutes=1)
             ).isoformat(),
         }
 

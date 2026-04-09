@@ -14,3 +14,6 @@ class MarketAnalyst(Protocol):
     async def analyse_market(self, market_data: dict, recent_news: list[str]) -> dict:
         """Estimate market probability with structured JSON output."""
 
+    async def classify_market(self, market_data: dict, recent_news: list[str]) -> dict:
+        """Classify market direction (BULLISH/BEARISH/NEUTRAL) + materiality score."""
+

@@ -81,7 +81,7 @@ class StatusWriter:
             "capital_usdc": round(self.risk_manager.total_capital, 2),
             "pnl_today_usdc": round(pnl_today, 2),
             "pnl_today_pct": round(
-                (pnl_today / max(self.risk_manager.total_capital, 1)) * 100,
+                (pnl_today / max(self.risk_manager._daily_start_capital, 1)) * 100,
                 2,
             ),
             "pnl_total_usdc": round(self.db.get_total_pnl(), 2),
@@ -166,7 +166,8 @@ class TerminalDashboard:
         capital = self.risk_manager.total_capital
         day_pnl = self.db.get_today_pnl()
         total_pnl = self.db.get_total_pnl()
-        day_pct = (day_pnl / max(capital, 1)) * 100  # single query, reused below
+        start_capital = self.risk_manager._daily_start_capital
+        day_pct = (day_pnl / max(start_capital, 1)) * 100
         today_label = "Simulated P&L Today" if config.DRY_RUN else "Today P&L"
         total_label = "Simulated Total P&L" if config.DRY_RUN else "Total P&L"
 

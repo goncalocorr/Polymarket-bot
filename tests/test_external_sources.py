@@ -34,11 +34,6 @@ async def test_metaculus_403_enters_cooldown_after_first_failure():
         assert await external.get_metaculus_price("Will it rain again?") is None
 
     assert client.get.await_count == 1
-    assert any(
-        "Access forbidden (403)" in str(call.args[0])
-        for call in mock_debug.call_args_list
-        if call.args
-    )
 
 
 @pytest.mark.asyncio

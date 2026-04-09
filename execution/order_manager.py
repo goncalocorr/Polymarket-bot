@@ -35,6 +35,7 @@ class Position:
     exit_price: Optional[float] = None
     close_reason: str = ""
     pnl_usdc: float = 0.0
+    realized_partial_pnl: float = 0.0  # Accumulated P&L from partial exits
     status: str = "OPEN"  # OPEN, CLOSING, CLOSED, STOPPED
 
     @property
@@ -103,6 +104,7 @@ class OrderManager:
                     else datetime.now(timezone.utc)
                 ),
                 close_reason=t.get("close_reason", "") or "",
+                realized_partial_pnl=float(t.get("realized_partial_pnl", 0) or 0),
             )
             self.positions[pos.id] = pos
         if open_trades:
@@ -171,7 +173,13 @@ class OrderManager:
 
         current_price = self.ws.get_mid_price(pos.token_id)
         if current_price is None:
-            current_price = pos.entry_price
+            logger.warning(
+                f"No live price for {pos.id} ({pos.token_id[:16]}...) — "
+                f"deferring close until price data is available"
+            )
+            async with self._lock:
+                pos.status = "OPEN"  # Revert from CLOSING
+            return None
 
         # Place exit order (opposite side)
         exit_side = "SELL" if pos.side == "BUY" else "BUY"
@@ -206,15 +214,17 @@ class OrderManager:
             )
             async with self._lock:
                 pos.size_usdc -= result.fill_size
+                pos.realized_partial_pnl += partial_pnl
                 pos.status = "OPEN"  # Revert from CLOSING under lock
             # Persist reduced size to DB so restarts reflect partial exit
-            self._on_partial_exit(pos, result.fill_size, partial_pnl)
+            await self._on_partial_exit(pos, result.fill_size, partial_pnl)
             return None
 
         async with self._lock:
             pos.exit_price = result.fill_price if result.filled else current_price
             pos.close_reason = reason or "manual"
-            pos.pnl_usdc = pos.current_pnl(pos.exit_price)
+            # Include P&L from any prior partial exits so the total is accurate
+            pos.pnl_usdc = pos.current_pnl(pos.exit_price) + pos.realized_partial_pnl
             pos.closed_at = datetime.now(timezone.utc)
             pos.status = "CLOSED"
 
@@ -224,7 +234,7 @@ class OrderManager:
         )
         return pos
 
-    def _on_partial_exit(self, pos: Position, fill_size: float, partial_pnl: float = 0.0):
+    async def _on_partial_exit(self, pos: Position, fill_size: float, partial_pnl: float = 0.0):
         """Hook for subclasses/callers to persist partial exit size changes."""
         pass
 
@@ -286,7 +296,12 @@ class OrderManager:
 
             # Position-level stop: -20% of invested amount.
             # If the strategy provided an explicit stop, use that instead.
-            if pos.stop_loss is None and unrealised <= -(pos.size_usdc * 0.20):
+            # Skip arb legs — they must be closed as a group, not individually.
+            if (
+                pos.stop_loss is None
+                and not pos.strategy.startswith("multi_outcome")
+                and unrealised <= -(pos.size_usdc * 0.20)
+            ):
                 p = await self.close_position(pos.id, "position-stop-20%")
                 if p:
                     closed.append(p)

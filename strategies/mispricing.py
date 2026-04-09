@@ -27,7 +27,7 @@ def _parse_outcome_price(raw: str | list | None, default: float | None = 0.5) ->
             return default
     if isinstance(raw, str):
         try:
-            return float(raw.strip("[]").split(",")[0])
+            return float(raw.strip("[]").split(",")[0].strip().strip('"'))
         except (ValueError, IndexError):
             return default
     return default
@@ -239,11 +239,21 @@ class MispricingStrategy(BaseStrategy):
             )
         if pnl_usdc >= 0 and not is_stop_reason:
             return
-        until = datetime.now(timezone.utc) + self.reentry_cooldown
+
+        # Progressive cooldown: each recent loss on this token doubles the wait.
+        # Base = reentry_cooldown (30 min), max = 8x (4 hours).
+        recent_losses = self._loss_events.get(token_id, [])
+        cutoff = datetime.now(timezone.utc) - self.strikeout_lookback
+        recent_count = sum(1 for dt in recent_losses if dt >= cutoff)
+        multiplier = min(2 ** max(recent_count - 1, 0), 8)
+        cooldown = self.reentry_cooldown * multiplier
+
+        until = datetime.now(timezone.utc) + cooldown
         self._cooldown_until[token_id] = until
         logger.info(
             f"Mispricing: Cooldown on {token_id[:16]}... until "
-            f"{until.strftime('%H:%M UTC')} after {reason or 'loss'}"
+            f"{until.strftime('%H:%M UTC')} after {reason or 'loss'} "
+            f"({multiplier}x, {recent_count} recent losses)"
         )
 
     async def restore_runtime_state(
@@ -343,6 +353,9 @@ class MispricingStrategy(BaseStrategy):
             question = market.get("question", "")
             poly_price = _parse_outcome_price(market.get("outcomePrices"), default=None)
             if poly_price is None:
+                continue
+            # Skip extreme prices — huge spread, illiquid, and near-resolved
+            if not (config.MISPRICING_MIN_PRICE <= poly_price <= config.MISPRICING_MAX_PRICE):
                 continue
             external_prices = await self.external.find_matching_prices(question)
             if not external_prices:

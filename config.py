@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # === Paths ===
 BASE_DIR = Path(__file__).parent
@@ -80,6 +80,24 @@ MAX_AI_CALLS_PER_DAY = int(
 # Backward-compatible alias for older code/tests/config.
 MAX_CLAUDE_CALLS_PER_DAY = MAX_AI_CALLS_PER_DAY
 
+# Two-tier model routing: cheap model for screening, main model for decisions.
+# Leave empty to skip screening and use the main model for everything.
+SCREENING_MODEL_ANTHROPIC = os.getenv("SCREENING_MODEL_ANTHROPIC", "claude-haiku-4-5-20251001")
+SCREENING_MODEL_OPENAI = os.getenv("SCREENING_MODEL_OPENAI", "gpt-4o-mini")
+
+# AI Agent niche market volume filter (USD). Only trade markets in this range.
+AI_AGENT_MIN_VOLUME = float(os.getenv("AI_AGENT_MIN_VOLUME", "1000"))
+AI_AGENT_MAX_VOLUME = float(os.getenv("AI_AGENT_MAX_VOLUME", "500000"))
+# Price range filter: skip near-resolved markets.
+AI_AGENT_MIN_PRICE = float(os.getenv("AI_AGENT_MIN_PRICE", "0.10"))
+AI_AGENT_MAX_PRICE = float(os.getenv("AI_AGENT_MAX_PRICE", "0.90"))
+# Minimum materiality score from classification to generate a signal.
+AI_AGENT_MIN_MATERIALITY = float(os.getenv("AI_AGENT_MIN_MATERIALITY", "0.3"))
+# Require news to exist before calling AI (saves budget; set false for broader coverage).
+AI_AGENT_REQUIRE_NEWS = os.getenv("AI_AGENT_REQUIRE_NEWS", "false").lower() == "true"
+# Max markets to classify per cycle (to control costs within a single scan).
+AI_AGENT_MAX_CLASSIFICATIONS_PER_CYCLE = int(os.getenv("AI_AGENT_MAX_CLASSIFICATIONS_PER_CYCLE", "5"))
+
 # === Notifications ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -113,6 +131,9 @@ MAX_SPREAD_CENTS = float(os.getenv("MAX_SPREAD_CENTS", "3"))
 MIN_DAYS_TO_RESOLUTION = int(os.getenv("MIN_DAYS_TO_RESOLUTION", "3"))
 MAX_DAYS_TO_RESOLUTION = int(os.getenv("MAX_DAYS_TO_RESOLUTION", "60"))
 MIN_MISPRICING_PCT = float(os.getenv("MIN_MISPRICING_PCT", "0.08"))
+# Price range filter: skip near-0 and near-1 markets (huge spread, illiquid)
+MISPRICING_MIN_PRICE = float(os.getenv("MISPRICING_MIN_PRICE", "0.10"))
+MISPRICING_MAX_PRICE = float(os.getenv("MISPRICING_MAX_PRICE", "0.90"))
 MISPRICING_REENTRY_COOLDOWN_MIN = int(
     os.getenv("MISPRICING_REENTRY_COOLDOWN_MIN", "30")
 )

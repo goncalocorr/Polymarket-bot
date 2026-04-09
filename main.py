@@ -96,17 +96,18 @@ class Orchestrator:
         # Wire partial exit persistence so DB stays in sync after partial fills
         db_ref = self.db
         risk_ref = self.risk_manager
-        def _persist_partial_exit(pos, fill_size, partial_pnl=0.0):
+        async def _persist_partial_exit(pos, fill_size, partial_pnl=0.0):
             try:
-                db_ref.update_trade_size(pos.id, pos.size_usdc)
+                db_ref.update_trade_size(
+                    pos.id, pos.size_usdc, pos.realized_partial_pnl
+                )
             except Exception as e:
                 logger.error(f"Failed to persist partial exit for {pos.id}: {e}")
             if partial_pnl != 0.0:
                 try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(risk_ref.record_trade_result(partial_pnl, close_reason="partial-exit"))
-                except RuntimeError:
-                    logger.warning(f"Could not record partial exit P&L for {pos.id}: no event loop")
+                    await risk_ref.record_trade_result(partial_pnl, close_reason="partial-exit")
+                except Exception as e:
+                    logger.error(f"Failed to record partial exit P&L for {pos.id}: {e}")
         self.order_manager._on_partial_exit = _persist_partial_exit
 
         # AI
@@ -218,8 +219,12 @@ class Orchestrator:
     async def _finalize_closed_position(self, pos, reason: str = ""):
         """Apply accounting side-effects for a closed position."""
         close_reason = getattr(pos, "close_reason", "") or reason or pos.status
+        # Partial exit P&L was already recorded to risk manager incrementally;
+        # only send the remainder P&L to avoid double-counting.
+        partial_already_recorded = getattr(pos, "realized_partial_pnl", 0.0)
+        remainder_pnl = pos.pnl_usdc - partial_already_recorded
         await self.risk_manager.record_trade_result(
-            pos.pnl_usdc,
+            remainder_pnl,
             close_reason=close_reason,
         )
         self.db.close_trade(
@@ -228,6 +233,7 @@ class Orchestrator:
             pos.pnl_usdc,
             close_reason=close_reason,
         )
+        # Record the full P&L (including partials) for strategy tracking
         self.tracker.record_trade(pos.strategy, pos.pnl_usdc)
         mispricing = getattr(self, "mispricing", None)
         if mispricing and pos.strategy == mispricing.name:
@@ -378,6 +384,15 @@ class Orchestrator:
                     await self._rollback_arb_group(opened_positions, group_id)
                     return
 
+        # Mark event as executed immediately so it's not re-signalled,
+        # even if notifications below fail.
+        event_id = signals[0].arb_event_id
+        if (
+            event_id
+            and signals[0].strategy == self.multi_outcome.name
+        ):
+            self.multi_outcome.mark_event_executed(event_id)
+
         for pos in opened_positions:
             try:
                 await self._notify_position_opened(pos)
@@ -385,13 +400,6 @@ class Orchestrator:
                 logger.error(
                     f"Failed to send open notification for {pos.id}: {e}"
                 )
-
-        event_id = signals[0].arb_event_id
-        if (
-            event_id
-            and signals[0].strategy == self.multi_outcome.name
-        ):
-            self.multi_outcome.mark_event_executed(event_id)
 
         logger.info(
             f"Arb group {group_id} executed successfully "
@@ -544,6 +552,14 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Daily report error: {e}")
 
+        # Housekeeping: prune old reward snapshots to prevent unbounded growth
+        try:
+            pruned = self.db.prune_maker_reward_snapshots(keep_recent=5000)
+            if pruned:
+                logger.info(f"Pruned {pruned} old maker reward snapshots")
+        except Exception as e:
+            logger.error(f"Reward snapshot cleanup error: {e}")
+
     async def _restore_risk_state_from_db(self):
         """Rebuild risk state from persisted closed trades after a restart."""
         today_pnl = self.db.get_today_pnl()
@@ -564,9 +580,11 @@ class Orchestrator:
             # Skip time-stop exits in dry-run (not real losses)
             if config.DRY_RUN and close_reason == "time-stop":
                 continue
-            # Breakeven (pnl == 0) shouldn't interrupt a losing streak
+            # Breakeven shouldn't interrupt a losing streak, but also isn't a loss
             if pnl > 0:
                 break
+            if pnl == 0:
+                continue
             closed_at = trade.get("closed_at")
             if not closed_at:
                 break
@@ -730,6 +748,9 @@ class Orchestrator:
         await self.external.close()
         await self.bot.close()
         await self.telegram.close()
+        analyst = getattr(self, "analyst", None)
+        if analyst and hasattr(analyst, "close"):
+            await analyst.close()
         instance_lock = getattr(self, "_instance_lock", None)
         if instance_lock:
             instance_lock.release()
@@ -746,15 +767,17 @@ async def main():
     def shutdown_handler():
         asyncio.create_task(orchestrator.stop())
 
+    def _make_win_handler(loop_ref, handler_ref):
+        def _win_handler(signum, frame):
+            loop_ref.call_soon_threadsafe(handler_ref)
+        return _win_handler
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, shutdown_handler)
         except NotImplementedError:
             # Windows doesn't support add_signal_handler — use signal.signal
-            def _win_handler(signum, frame):
-                loop.call_soon_threadsafe(shutdown_handler)
-
-            signal.signal(sig, _win_handler)
+            signal.signal(sig, _make_win_handler(loop, shutdown_handler))
 
     try:
         await orchestrator.start()

@@ -23,7 +23,6 @@ from core.signer import (
     get_address,
     CTF_EXCHANGE_ADDRESS,
 )
-from core.utils import retry_async
 
 
 @dataclass

@@ -119,12 +119,21 @@ class RewardMarketMakerStrategy(BaseStrategy):
         return []
 
     async def run(self):
+        consecutive_errors = 0
         while self._running:
             try:
                 if self.is_active:
                     await self.cycle()
+                consecutive_errors = 0
             except Exception as e:
-                logger.error(f"RewardMarketMaker loop error: {e}")
+                consecutive_errors += 1
+                backoff = min(config.MAKER_LOOP_INTERVAL_S * (2 ** consecutive_errors), 300)
+                logger.error(
+                    f"RewardMarketMaker loop error (#{consecutive_errors}): {e} "
+                    f"— backing off {backoff:.0f}s"
+                )
+                await asyncio.sleep(backoff)
+                continue
             await asyncio.sleep(config.MAKER_LOOP_INTERVAL_S)
 
     async def cycle(self):
@@ -780,7 +789,7 @@ class RewardMarketMakerStrategy(BaseStrategy):
         scoring_flags = await self.bot.get_orders_scoring(
             [quote.order_id for quote in active_quotes]
         )
-        self.quote_manager.update_scoring(scoring_flags)
+        await self.quote_manager.update_scoring(scoring_flags)
 
     def _persist_reward_snapshots(self):
         for quote in self.quote_manager.get_active_quotes():

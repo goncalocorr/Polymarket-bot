@@ -30,6 +30,7 @@ _kalshi_skip_logged = False
 _kalshi_markets_cache: tuple[float, list[dict]] = (0.0, [])
 _kalshi_markets_lock = asyncio.Lock()
 _external_price_cache: dict[str, tuple[float, dict[str, float]]] = {}
+_external_price_lock = asyncio.Lock()
 
 
 def _metaculus_cache_get(question: str) -> tuple[bool, Optional[float]]:
@@ -204,21 +205,25 @@ class ExternalSources:
     # --- Metaculus ---
 
     async def get_metaculus_price(self, question: str) -> Optional[float]:
-        """Fetch probability from Metaculus with caching and rate limiting."""
+        """Fetch probability from Metaculus with caching and rate limiting.
+
+        NOTE: As of 2026-04, Metaculus API returns 403 for unauthenticated
+        requests.  We attempt one probe per cooldown period; if it still
+        fails, lookups remain disabled until the next cooldown expires.
+        """
         global _metaculus_disabled_until
 
-        if time.time() < _metaculus_disabled_until:
-            return None
+        async with _metaculus_rate_lock:
+            if time.time() < _metaculus_disabled_until:
+                return None
 
         # Check cache first
         hit, cached_value = _metaculus_cache_get(question)
         if hit:
-            logger.debug(f"Metaculus: Cache hit for '{question[:40]}...'")
             return cached_value
 
         client = await self._get_client()
         try:
-            # Rate limit: keep at least 2s between requests globally.
             await _metaculus_throttle()
 
             resp = await client.get(
@@ -243,18 +248,12 @@ class ExternalSources:
 
             _metaculus_cache_set(question, None)
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                _metaculus_cache_set(question, None)
-                logger.debug(
-                    "Metaculus: Rate limited (429) — cached None to avoid repeated delays"
-                )
-            elif e.response.status_code == 403:
-                _metaculus_disabled_until = (
-                    time.time() + _METACULUS_FORBIDDEN_COOLDOWN_S
-                )
-                logger.debug(
-                    "Metaculus: Access forbidden (403) - disabling lookups for 60 minutes"
-                )
+            if e.response.status_code in (429, 403):
+                # Disable for a long period — API requires auth we don't have.
+                async with _metaculus_rate_lock:
+                    _metaculus_disabled_until = (
+                        time.time() + _METACULUS_FORBIDDEN_COOLDOWN_S
+                    )
             else:
                 logger.debug(f"Metaculus API error: {e.response.status_code}")
         except httpx.HTTPError as e:
@@ -268,30 +267,45 @@ class ExternalSources:
     async def get_manifold_price(self, question: str) -> Optional[float]:
         """Fetch probability from Manifold Markets using search endpoint."""
         client = await self._get_client()
-        try:
-            resp = await client.get(
-                config.MANIFOLD_API_URL,
-                params={"term": question, "limit": 5},
-            )
-            resp.raise_for_status()
-            markets = resp.json()
+        last_err = None
+        for attempt in range(2):
+            try:
+                resp = await client.get(
+                    config.MANIFOLD_API_URL,
+                    params={"term": question, "limit": 5},
+                )
+                resp.raise_for_status()
+                markets = resp.json()
 
-            # Handle both list and dict responses
-            if isinstance(markets, dict):
-                markets = markets.get("markets", markets.get("data", []))
-            if not isinstance(markets, list):
-                logger.debug(f"Manifold: Unexpected response type: {type(markets).__name__}")
+                # Handle both list and dict responses
+                if isinstance(markets, dict):
+                    markets = markets.get("markets", markets.get("data", []))
+                if not isinstance(markets, list):
+                    return None
+
+                best = self._fuzzy_match(question, markets, key="question")
+                if best:
+                    return best.get("probability")
                 return None
-
-            best = self._fuzzy_match(question, markets, key="question")
-            if best:
-                return best.get("probability")
-        except httpx.HTTPStatusError as e:
-            logger.debug(f"Manifold API error: {e.response.status_code}")
-        except httpx.HTTPError as e:
-            logger.debug(f"Manifold API connection error: {type(e).__name__}")
-        except Exception as e:
-            logger.debug(f"Manifold lookup error: {type(e).__name__}: {e}")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code >= 500 and attempt == 0:
+                    last_err = e
+                    await asyncio.sleep(2)
+                    continue
+                logger.debug(f"Manifold API error: {e.response.status_code}")
+                return None
+            except httpx.HTTPError as e:
+                last_err = e
+                if attempt == 0:
+                    await asyncio.sleep(2)
+                    continue
+                logger.debug(f"Manifold API connection error: {type(e).__name__}")
+                return None
+            except Exception as e:
+                logger.debug(f"Manifold lookup error: {type(e).__name__}: {e}")
+                return None
+        if last_err:
+            logger.debug(f"Manifold: failed after retries: {last_err}")
         return None
 
     # --- Aggregated ---
@@ -304,9 +318,10 @@ class ExternalSources:
         Each source is independent — one failure never blocks the others.
         """
         cache_key = question[:100].lower().strip()
-        cached = _external_price_cache.get(cache_key)
-        if cached and time.time() - cached[0] <= config.EXTERNAL_PRICE_CACHE_TTL_S:
-            return dict(cached[1])
+        async with _external_price_lock:
+            cached = _external_price_cache.get(cache_key)
+            if cached and time.time() - cached[0] <= config.EXTERNAL_PRICE_CACHE_TTL_S:
+                return dict(cached[1])
 
         async def _safe_fetch(name: str, fetch_coro):
             try:
@@ -333,11 +348,12 @@ class ExternalSources:
         if manifold is not None:
             results["manifold"] = manifold
 
-        _external_price_cache[cache_key] = (time.time(), dict(results))
-        if len(_external_price_cache) > 1000:
-            oldest = sorted(_external_price_cache, key=lambda k: _external_price_cache[k][0])
-            for key in oldest[:500]:
-                _external_price_cache.pop(key, None)
+        async with _external_price_lock:
+            _external_price_cache[cache_key] = (time.time(), dict(results))
+            if len(_external_price_cache) > 1000:
+                oldest = sorted(_external_price_cache, key=lambda k: _external_price_cache[k][0])
+                for key in oldest[:500]:
+                    _external_price_cache.pop(key, None)
 
         return results
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -97,6 +98,7 @@ class QuoteManager:
         self.ws = ws
         self.active_quotes: dict[str, ActiveQuote] = {}
         self.inventory: dict[str, InventoryLot] = {}
+        self._lock = asyncio.Lock()
 
     def restore_state(self):
         self.active_quotes.clear()
@@ -190,31 +192,33 @@ class QuoteManager:
         return drift_bps >= config.MAKER_REQUOTE_BPS
 
     async def sync_quotes(self, desired_quotes: list[DesiredQuote]):
-        desired_by_key = {quote.quote_key: quote for quote in desired_quotes}
-        active_keys = set(self.active_quotes)
+        async with self._lock:
+            desired_by_key = {quote.quote_key: quote for quote in desired_quotes}
+            active_keys = set(self.active_quotes)
 
-        for quote_key in list(active_keys - set(desired_by_key)):
-            current = self.active_quotes.get(quote_key)
-            if current and current.reconcile_pending:
-                continue
-            await self.cancel_quote(quote_key, reason="not-selected")
+            for quote_key in list(active_keys - set(desired_by_key)):
+                current = self.active_quotes.get(quote_key)
+                if current and current.reconcile_pending:
+                    continue
+                await self._cancel_quote_unlocked(quote_key, reason="not-selected")
 
-        for desired in desired_quotes:
-            current = self.active_quotes.get(desired.quote_key)
-            if current and current.reconcile_pending:
-                continue
-            if current and not self._needs_refresh(current, desired):
-                continue
-            if current:
-                await self.cancel_quote(desired.quote_key, reason="requote")
-            await self._place_quote(desired)
+            for desired in desired_quotes:
+                current = self.active_quotes.get(desired.quote_key)
+                if current and current.reconcile_pending:
+                    continue
+                if current and not self._needs_refresh(current, desired):
+                    continue
+                if current:
+                    await self._cancel_quote_unlocked(desired.quote_key, reason="requote")
+                await self._place_quote(desired)
 
     async def cancel_matching_quotes(self, predicate, reason: str):
-        for quote_key, active in list(self.active_quotes.items()):
-            if active.reconcile_pending:
-                continue
-            if predicate(active):
-                await self.cancel_quote(quote_key, reason=reason)
+        async with self._lock:
+            for quote_key, active in list(self.active_quotes.items()):
+                if active.reconcile_pending:
+                    continue
+                if predicate(active):
+                    await self._cancel_quote_unlocked(quote_key, reason=reason)
 
     async def _place_quote(self, desired: DesiredQuote) -> Optional[ActiveQuote]:
         result = await self.bot.place_order(
@@ -275,6 +279,11 @@ class QuoteManager:
         return active
 
     async def cancel_quote(self, quote_key: str, reason: str = "cancelled") -> bool:
+        async with self._lock:
+            return await self._cancel_quote_unlocked(quote_key, reason=reason)
+
+    async def _cancel_quote_unlocked(self, quote_key: str, reason: str = "cancelled") -> bool:
+        """Cancel a quote without acquiring the lock (caller must hold it)."""
         current = self.active_quotes.get(quote_key)
         if not current:
             return False
@@ -297,11 +306,16 @@ class QuoteManager:
         return cancelled
 
     async def cancel_all(self, reason: str = "shutdown"):
-        for quote_key in list(self.active_quotes):
-            await self.cancel_quote(quote_key, reason=reason)
+        async with self._lock:
+            for quote_key in list(self.active_quotes):
+                await self._cancel_quote_unlocked(quote_key, reason=reason)
 
     async def reconcile_live_orders(self):
         """Update local quote state when live orders disappear or fill."""
+        async with self._lock:
+            await self._reconcile_live_orders_unlocked()
+
+    async def _reconcile_live_orders_unlocked(self):
         if config.DRY_RUN:
             await self._simulate_dry_run_reconciliation()
             return
@@ -405,16 +419,17 @@ class QuoteManager:
             )
             self.active_quotes.pop(quote_key, None)
 
-    def update_scoring(self, scoring_flags: dict[str, bool]):
-        for active in self.active_quotes.values():
-            scoring = scoring_flags.get(active.order_id, active.score_estimate > 0)
-            active.scoring = scoring
-            active.updated_at = datetime.now(timezone.utc)
-            self.db.update_maker_order(
-                active.order_id,
-                scoring=scoring,
-                score_estimate=active.score_estimate,
-            )
+    async def update_scoring(self, scoring_flags: dict[str, bool]):
+        async with self._lock:
+            for active in self.active_quotes.values():
+                scoring = scoring_flags.get(active.order_id, active.score_estimate > 0)
+                active.scoring = scoring
+                active.updated_at = datetime.now(timezone.utc)
+                self.db.update_maker_order(
+                    active.order_id,
+                    scoring=scoring,
+                    score_estimate=active.score_estimate,
+                )
 
     def _apply_fill(
         self,

@@ -166,6 +166,13 @@ class FlashCrashStrategy(BaseStrategy):
             del self._tracked_markets[token_id]
             self._signalled.pop(token_id, None)
 
+        # Prune signalled entries for tokens no longer tracked
+        stale_signalled = [
+            tid for tid in self._signalled if tid not in self._tracked_markets
+        ]
+        for tid in stale_signalled:
+            del self._signalled[tid]
+
         if expired:
             logger.info(f"FlashCrash: Removed {len(expired)} expired markets")
 

@@ -15,9 +15,13 @@ from strategies.mispricing import _parse_outcome_price, _pick_token_id
 
 class AIAgentStrategy(BaseStrategy):
     """
-    Uses an AI analyst as a qualitative confirmation layer.
-    Only invoked when mispricing divergence is in the grey zone (5-8%).
-    Limited to MAX_AI_CALLS_PER_DAY to control costs.
+    Uses an AI classifier to find directional opportunities in niche markets.
+
+    Pipeline: volume filter -> price range filter -> news/external lookup
+    -> AI classification (direction + materiality) -> signal generation.
+
+    External price sources are optional context — not a hard requirement.
+    This allows the strategy to function even when external sources are down.
     """
 
     def __init__(
@@ -26,16 +30,12 @@ class AIAgentStrategy(BaseStrategy):
         external: ExternalSources,
         analyst: MarketAnalyst,
         db=None,
-        grey_zone_min: float = 0.05,
-        grey_zone_max: float = 0.08,
     ):
         super().__init__("ai_agent")
         self.gamma = gamma
         self.external = external
         self.analyst = analyst
         self.db = db
-        self.grey_zone_min = grey_zone_min
-        self.grey_zone_max = grey_zone_max
         self._calls_today = 0
         self._last_reset_date: str = ""
         self._state_key = "ai_agent:daily_calls"
@@ -113,7 +113,13 @@ class AIAgentStrategy(BaseStrategy):
         logger.info(f"AIAgent: Strategy initialized ({provider}:{model})")
 
     async def evaluate(self) -> list[Signal]:
-        """Find grey-zone markets and ask the configured AI provider for confirmation."""
+        """Find niche markets, gather context, and classify with AI.
+
+        Pipeline: volume filter -> price range filter -> news/external lookup
+        -> AI classification (direction + materiality) -> signal generation.
+
+        External prices are optional enrichment, not a hard gate.
+        """
         if not self.is_active:
             return []
 
@@ -124,12 +130,16 @@ class AIAgentStrategy(BaseStrategy):
 
         signals = []
         poly_markets = await self.gamma.get_markets_for_mispricing()
-        markets_with_external = 0
-        grey_zone_candidates = 0
+        volume_filtered = 0
+        price_filtered = 0
+        news_filtered = 0
         ai_calls_this_cycle = 0
+        max_per_cycle = config.AI_AGENT_MAX_CLASSIFICATIONS_PER_CYCLE
 
         for market in poly_markets:
             if self._calls_today >= config.MAX_AI_CALLS_PER_DAY:
+                break
+            if ai_calls_this_cycle >= max_per_cycle:
                 break
 
             question = market.get("question", "")
@@ -139,47 +149,70 @@ class AIAgentStrategy(BaseStrategy):
             volume_24h = float(market.get("volume24hr", 0) or 0)
             end_date = market.get("endDate", "")
 
-            external_prices = await self.external.find_matching_prices(question)
-            if not external_prices:
+            # Niche market filter: skip high-volume (sophisticated bots) and
+            # low-volume (illiquid) markets.
+            if not (config.AI_AGENT_MIN_VOLUME <= volume_24h <= config.AI_AGENT_MAX_VOLUME):
+                volume_filtered += 1
                 continue
-            markets_with_external += 1
 
-            avg_external = sum(external_prices.values()) / len(external_prices)
-            divergence = abs(avg_external - poly_price)
-
-            if not (self.grey_zone_min <= divergence <= self.grey_zone_max):
+            # Price range filter: skip near-resolved markets where the outcome
+            # is already largely priced in.
+            if not (config.AI_AGENT_MIN_PRICE <= poly_price <= config.AI_AGENT_MAX_PRICE):
+                price_filtered += 1
                 continue
-            grey_zone_candidates += 1
 
+            # Gather context: news and external prices (both optional).
             news = await self.external.get_recent_news(question)
+            external_prices = await self.external.find_matching_prices(question)
+
+            # If configured to require news and none found, skip.
+            if config.AI_AGENT_REQUIRE_NEWS and not news:
+                news_filtered += 1
+                continue
+
             market_data = {
                 "question": question,
                 "price": poly_price,
                 "volume": volume_24h,
                 "end_date": end_date,
-                "external_prices": external_prices,
+                "external_prices": external_prices or {},
             }
 
             try:
-                analysis = await self.analyst.analyse_market(market_data, news)
+                classification = await self.analyst.classify_market(market_data, news)
                 self._calls_today += 1
                 ai_calls_this_cycle += 1
                 self._persist_daily_counter()
             except Exception as e:
                 provider = getattr(self.analyst, "provider_name", "AI")
+                err_str = str(e).lower()
+                # On rate-limit, retryable, or timeout errors, stop trying more
+                # markets this cycle to avoid burning the evaluation timeout.
+                if any(kw in err_str for kw in ("429", "rate", "timed out", "retryable", "credit", "balance", "quota")):
+                    logger.warning(
+                        f"AIAgent: {provider} rate-limited — stopping cycle "
+                        f"after {ai_calls_this_cycle} calls ({e})"
+                    )
+                    break
                 logger.error(
-                    f"AIAgent: {provider} analysis failed for '{question}': {e}"
+                    f"AIAgent: {provider} classification failed for '{question}': {e}"
                 )
                 continue
 
-            ai_prob = analysis.get("probability", 0.5)
-            ai_confidence = analysis.get("confidence", 0.0)
-            reasoning = analysis.get("reasoning", "")
+            direction = classification.get("direction", "NEUTRAL")
+            materiality = classification.get("materiality", 0.0)
+            ai_confidence = classification.get("confidence", 0.0)
+            reasoning = classification.get("reasoning", "")
 
-            ai_divergence = ai_prob - poly_price
-            if abs(ai_divergence) < self.grey_zone_min:
+            # Skip neutral signals or low-materiality noise
+            if direction == "NEUTRAL":
+                logger.debug(f"AIAgent: Neutral for '{question[:50]}...'")
+                continue
+
+            if materiality < config.AI_AGENT_MIN_MATERIALITY:
                 logger.debug(
-                    f"AIAgent: AI says fair price for '{question[:50]}...'"
+                    f"AIAgent: Low materiality ({materiality:.2f}) for "
+                    f"'{question[:50]}...'"
                 )
                 continue
 
@@ -190,33 +223,54 @@ class AIAgentStrategy(BaseStrategy):
                 )
                 continue
 
-            if ai_divergence > 0:
-                side = "BUY"
+            # Edge formula: materiality-weighted distance from current price.
+            # Bullish: edge = materiality * (1 - price)  → YES token underpriced
+            # Bearish: edge = materiality * price         → NO token underpriced
+            min_edge = config.MIN_KELLY_EDGE  # Reuse the 3% min-edge threshold
+            if direction == "BULLISH":
+                edge = materiality * (1 - poly_price)
+                is_yes = True
                 price = poly_price
-                estimated_prob = ai_prob
-            else:
-                side = "BUY"
+                estimated_prob = poly_price + edge
+            else:  # BEARISH
+                edge = materiality * poly_price
+                is_yes = False
                 price = 1.0 - poly_price
-                estimated_prob = 1.0 - ai_prob
+                estimated_prob = (1.0 - poly_price) + edge
+
+            estimated_prob = min(estimated_prob, 0.99)
+
+            if edge < min_edge:
+                logger.debug(
+                    f"AIAgent: Edge too small ({edge:.3f}) for '{question[:50]}...'"
+                )
+                continue
 
             tokens = market.get("tokens", []) or market.get("clobTokenIds", [])
-            token_id = _pick_token_id(tokens, is_yes=(ai_divergence > 0))
+            token_id = _pick_token_id(tokens, is_yes=is_yes)
 
             if not token_id:
                 continue
+
+            # Exit levels derived from materiality-weighted edge
+            tp_price = min(price + edge * 0.8, 0.95)
+            sl_price = max(price - edge * 1.5, 0.01)
 
             signal = Signal(
                 strategy=self.name,
                 token_id=token_id,
                 market_question=question,
-                side=side,
+                side="BUY",
                 price=price,
                 size_usdc=0,
+                take_profit=tp_price,
+                stop_loss=sl_price,
                 estimated_prob=estimated_prob,
                 confidence=ai_confidence,
                 reasoning=(
-                    f"AI estimate: {ai_prob:.2f} (confidence: "
-                    f"{ai_confidence:.2f}). {reasoning}"
+                    f"AI classification: {direction} (materiality: "
+                    f"{materiality:.2f}, confidence: {ai_confidence:.2f}). "
+                    f"{reasoning}"
                 ),
             )
             signals.append(signal)
@@ -224,17 +278,19 @@ class AIAgentStrategy(BaseStrategy):
             q_display = question[:60] + ("..." if len(question) > 60 else "")
             logger.info(
                 f"AIAgent: Signal for '{q_display}' - "
-                f"AI prob={ai_prob:.2f}, conf={ai_confidence:.2f}"
+                f"{direction} mat={materiality:.2f}, conf={ai_confidence:.2f}, "
+                f"edge={edge:.3f}"
             )
 
         logger.debug(
             "AIAgent: scan summary - "
             f"markets={len(poly_markets)} "
-            f"external={markets_with_external} "
-            f"grey_zone={grey_zone_candidates} "
+            f"vol_skip={volume_filtered} "
+            f"price_skip={price_filtered} "
+            f"news_skip={news_filtered} "
             f"ai_calls={ai_calls_this_cycle} "
             f"signals={len(signals)} "
-            f"remaining_budget={max(config.MAX_AI_CALLS_PER_DAY - self._calls_today, 0)}"
+            f"budget_left={max(config.MAX_AI_CALLS_PER_DAY - self._calls_today, 0)}"
         )
 
         return signals

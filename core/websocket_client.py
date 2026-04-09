@@ -78,7 +78,7 @@ class MarketWebSocket:
         logger.debug(f"Subscribed to {token_id}")
 
     async def unsubscribe(self, token_id: str):
-        """Unsubscribe from a token's order book."""
+        """Unsubscribe from a token's order book and clean up local data."""
         if not self._ws:
             return
 
@@ -88,6 +88,8 @@ class MarketWebSocket:
         })
         await self._ws.send(msg)
         self._subscriptions.discard(token_id)
+        self._order_books.pop(token_id, None)
+        self._price_history.pop(token_id, None)
         logger.debug(f"Unsubscribed from {token_id}")
 
     def get_mid_price(self, token_id: str) -> Optional[float]:
@@ -331,6 +333,7 @@ class MarketWebSocket:
                 # Clear stale book data and re-subscribe after reconnect
                 if did_reconnect:
                     self._order_books.clear()
+                    self._price_history.clear()
                     for token_id in list(self._subscriptions):
                         await self.subscribe(token_id, force=True)
                 await self.listen()

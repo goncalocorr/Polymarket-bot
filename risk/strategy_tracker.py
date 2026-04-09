@@ -6,6 +6,7 @@ Uses a rolling window of the last N trades per strategy to detect drawdowns
 early and adapt capital allocation.
 """
 
+import time
 from datetime import datetime, timezone, timedelta
 
 from loguru import logger
@@ -13,6 +14,8 @@ from loguru import logger
 import config
 from storage.database import Database
 from strategies.base import BaseStrategy
+
+_STATS_CACHE_TTL_S = 30.0  # Cache rolling stats for 30 seconds
 
 
 class StrategyTracker:
@@ -27,20 +30,28 @@ class StrategyTracker:
         self.db = db
         self._strategies = {s.name: s for s in strategies}
         self._paused_until: dict[str, datetime] = {}
+        self._stats_cache: dict[str, tuple[float, dict]] = {}  # name -> (ts, stats)
 
     def record_trade(self, strategy_name: str, pnl: float):
         """Record a completed trade for a strategy."""
         won = 1 if pnl > 0 else 0
         self.db.record_strategy_trade(strategy_name, pnl, won)
+        # Invalidate cached stats so the next check sees the new trade
+        self._stats_cache.pop(strategy_name, None)
 
         # Check auto-pause / auto-boost after recording
         self._evaluate_strategy(strategy_name)
 
     def get_stats(self, strategy_name: str) -> dict:
-        """Get rolling stats for a strategy."""
-        return self.db.get_strategy_rolling_stats(
+        """Get rolling stats for a strategy (cached for 30s to avoid per-signal DB queries)."""
+        cached = self._stats_cache.get(strategy_name)
+        if cached and time.time() - cached[0] <= _STATS_CACHE_TTL_S:
+            return cached[1]
+        stats = self.db.get_strategy_rolling_stats(
             strategy_name, config.TRACKER_ROLLING_WINDOW
         )
+        self._stats_cache[strategy_name] = (time.time(), stats)
+        return stats
 
     def get_size_multiplier(self, strategy_name: str) -> float:
         """

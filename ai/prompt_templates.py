@@ -4,6 +4,20 @@ Ported from Polymarket/agents superforecaster patterns.
 """
 
 
+SYSTEM_CLASSIFIER = """You are an expert prediction market analyst. Your job is to classify \
+how recent information affects the likelihood of a market event resolving YES.
+
+You do NOT estimate probabilities — LLMs are poor at numerical calibration. Instead, you:
+1. Classify the directional impact: BULLISH (more likely YES), BEARISH (less likely YES), or NEUTRAL.
+2. Score the materiality of the information on a 0.0-1.0 scale:
+   - 0.0 = no new information, noise, or already priced in
+   - 0.3 = minor update, weakly suggestive
+   - 0.6 = meaningful development with clear directional implications
+   - 1.0 = decisive event that nearly guarantees the outcome
+3. Focus on what has CHANGED recently, not the base rate (the market price already reflects that).
+4. Be skeptical: most news is noise. Default materiality should be low unless evidence is strong."""
+
+
 SYSTEM_SUPERFORECASTER = """You are a Superforecaster — someone with a proven track record \
 of making accurate predictions about future events. You use systematic analysis, \
 avoid cognitive biases, and calibrate probabilities carefully.
@@ -73,4 +87,49 @@ Respond ONLY with valid JSON, no other text:
 Where:
 - probability: your estimate of YES probability (0.0 to 1.0)
 - confidence: how confident you are in this estimate (0.0 to 1.0)
+- reasoning: one-sentence explanation of the key driver"""
+
+
+def classification_prompt(
+    question: str,
+    price: float,
+    volume: float,
+    end_date: str,
+    external_info: str,
+    news_section: str,
+) -> str:
+    """
+    Build a classification prompt that asks for direction + materiality.
+    Returns the user message; pair with SYSTEM_CLASSIFIER as system prompt.
+    """
+    safe_question = _sanitize_external(question, max_len=200)
+    safe_end_date = _sanitize_external(end_date, max_len=30)
+    safe_external = _sanitize_external(external_info, max_len=500, allow_newlines=True)
+    safe_news = _sanitize_external(news_section, max_len=500, allow_newlines=True)
+
+    return f"""Classify how current information affects this prediction market.
+
+<market_data>
+Market question: {safe_question}
+Current Polymarket price: {price:.4f} (implies {price * 100:.1f}% probability)
+24h volume: ${volume:,.0f}
+Resolution date: {safe_end_date}
+
+{safe_external}
+
+{safe_news}
+</market_data>
+
+Analyse the information above and classify:
+1. Is the available evidence BULLISH, BEARISH, or NEUTRAL for YES?
+2. How material is this information (0.0 to 1.0)?
+3. Is the current market price already reflecting this information?
+
+Respond ONLY with valid JSON, no other text:
+{{"direction": "BULLISH", "materiality": 0.4, "confidence": 0.7, "reasoning": "brief explanation"}}
+
+Where:
+- direction: "BULLISH", "BEARISH", or "NEUTRAL"
+- materiality: how significant the new information is (0.0 to 1.0)
+- confidence: how confident you are in this classification (0.0 to 1.0)
 - reasoning: one-sentence explanation of the key driver"""

@@ -42,14 +42,13 @@ class RiskManager:
 
     def reset(self, total_capital: float = 500.0):
         """Reset all state — useful for tests and clean restarts."""
-        # Preserve lock and callbacks across resets
-        lock = getattr(self, '_lock', asyncio.Lock())
-        cbs_stop = getattr(self, '_on_stop_loss_callbacks', [])
-        cbs_cb = getattr(self, '_on_circuit_breaker_callbacks', [])
-        self.__init__(total_capital)
-        self._lock = lock
-        self._on_stop_loss_callbacks = cbs_stop
-        self._on_circuit_breaker_callbacks = cbs_cb
+        self.total_capital = total_capital
+        self._daily_start_capital = total_capital
+        self.daily_pnl = 0.0
+        self._last_reset_date = ""
+        self._consecutive_losses = 0
+        self._circuit_breaker_until = None
+        self._daily_stop_triggered = False
 
     def on_stop_loss(self, callback):
         self._on_stop_loss_callbacks.append(callback)
@@ -105,7 +104,9 @@ class RiskManager:
 
             if self._counts_toward_circuit_breaker(pnl, close_reason):
                 self._consecutive_losses += 1
-            else:
+            elif pnl > 0:
+                # Only actual wins reset the streak; breakeven (pnl == 0)
+                # leaves the counter unchanged — matches restore logic in main.py.
                 self._consecutive_losses = 0
 
             # Check daily stop-loss (based on start-of-day capital, not reduced)
@@ -204,6 +205,10 @@ class RiskManager:
     ) -> tuple[bool, float, str]:
         """Inner validation logic — must be called under self._lock."""
         self._reset_daily()
+
+        # 0. Sanity check on signal price
+        if signal.price <= 0 or signal.price >= 1:
+            return False, 0, f"Invalid signal price {signal.price}"
 
         # 1. Daily stop-loss
         if self._daily_stop_triggered:

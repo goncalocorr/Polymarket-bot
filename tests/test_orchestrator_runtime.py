@@ -81,7 +81,7 @@ def test_status_writer_emits_valid_utc_timestamp():
         get_open_positions=MagicMock(return_value=[]),
         ws=SimpleNamespace(get_mid_price=MagicMock(return_value=None)),
     )
-    risk_manager = SimpleNamespace(status="RUNNING", total_capital=500.0)
+    risk_manager = SimpleNamespace(status="RUNNING", total_capital=500.0, _daily_start_capital=500.0)
     db = SimpleNamespace(
         get_recent_trades=MagicMock(return_value=[]),
         get_today_pnl=MagicMock(return_value=12.5),
@@ -113,6 +113,7 @@ def test_status_writer_emits_pause_metadata():
         stop_reason="Circuit breaker active",
         resume_at="2026-04-02T09:00:00Z",
         total_capital=500.0,
+        _daily_start_capital=500.0,
     )
     db = SimpleNamespace(
         get_recent_trades=MagicMock(return_value=[]),
@@ -133,7 +134,7 @@ def test_status_writer_includes_close_reason_for_recent_trades():
         get_open_positions=MagicMock(return_value=[]),
         ws=SimpleNamespace(get_mid_price=MagicMock(return_value=None)),
     )
-    risk_manager = SimpleNamespace(status="RUNNING", total_capital=500.0)
+    risk_manager = SimpleNamespace(status="RUNNING", total_capital=500.0, _daily_start_capital=500.0)
     db = SimpleNamespace(
         get_recent_trades=MagicMock(
             return_value=[

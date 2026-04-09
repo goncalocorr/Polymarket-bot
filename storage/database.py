@@ -174,6 +174,10 @@ class Database:
             conn.execute("ALTER TABLE trades ADD COLUMN stop_loss REAL")
         if "close_reason" not in cols:
             conn.execute("ALTER TABLE trades ADD COLUMN close_reason TEXT")
+        if "realized_partial_pnl" not in cols:
+            conn.execute(
+                "ALTER TABLE trades ADD COLUMN realized_partial_pnl REAL DEFAULT 0"
+            )
 
     @contextmanager
     def _conn(self):
@@ -245,12 +249,14 @@ class Database:
                 (take_profit, stop_loss, trade_id),
             )
 
-    def update_trade_size(self, trade_id: str, size_usdc: float):
-        """Update the position size after a partial exit."""
+    def update_trade_size(
+        self, trade_id: str, size_usdc: float, realized_partial_pnl: float = 0.0
+    ):
+        """Update the position size and accumulated partial P&L after a partial exit."""
         with self._conn() as conn:
             conn.execute(
-                "UPDATE trades SET size_usdc=? WHERE id=?",
-                (size_usdc, trade_id),
+                "UPDATE trades SET size_usdc=?, realized_partial_pnl=? WHERE id=?",
+                (size_usdc, realized_partial_pnl, trade_id),
             )
 
     def get_open_trades(self) -> list[dict]:
@@ -633,6 +639,23 @@ class Database:
                     snapshot.get("recorded_at", datetime.now(timezone.utc).isoformat()),
                 ),
             )
+
+    def prune_maker_reward_snapshots(self, keep_recent: int = 5000):
+        """Delete old reward snapshots to prevent unbounded table growth."""
+        with self._conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM maker_reward_snapshots"
+            ).fetchone()["cnt"]
+            if count <= keep_recent:
+                return 0
+            deleted = conn.execute(
+                """DELETE FROM maker_reward_snapshots WHERE id NOT IN (
+                    SELECT id FROM maker_reward_snapshots
+                    ORDER BY recorded_at DESC LIMIT ?
+                )""",
+                (keep_recent,),
+            ).rowcount
+            return deleted
 
     def get_recent_maker_fills(self, limit: int = 25) -> list[dict]:
         with self._conn() as conn:

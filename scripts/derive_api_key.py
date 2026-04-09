@@ -6,6 +6,7 @@ Usage:
 """
 
 import asyncio
+import os
 import sys
 
 from core.bot import TradingBot
@@ -22,18 +23,21 @@ async def _run():
     try:
         creds = await bot.derive_api_credentials()
         output_path = config.BASE_DIR / ".derived_poly_api.env"
-        output_path.write_text(
-            "\n".join(
-                [
-                    "# Temporary Polymarket L2 credentials",
-                    f"POLY_API_KEY={creds.api_key}",
-                    f"POLY_API_SECRET={creds.secret}",
-                    f"POLY_API_PASSPHRASE={creds.passphrase}",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
+        content = "\n".join(
+            [
+                "# Temporary Polymarket L2 credentials",
+                f"POLY_API_KEY={creds.api_key}",
+                f"POLY_API_SECRET={creds.secret}",
+                f"POLY_API_PASSPHRASE={creds.passphrase}",
+                "",
+            ]
         )
+        # Write with restricted permissions (owner-only read/write)
+        fd = os.open(str(output_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, content.encode("utf-8"))
+        finally:
+            os.close(fd)
         print(
             f"Derived credentials written to {output_path.resolve()}",
             file=sys.stderr,

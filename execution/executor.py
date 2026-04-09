@@ -94,20 +94,25 @@ class ThreePhaseExecutor:
                 break
 
             # Calculate phase-specific parameters
+            # For BUY: increase price to be more aggressive
+            # For SELL: decrease price to be more aggressive
             if phase == 1:
                 phase_price = price
                 timeout = config.PHASE1_TIMEOUT_S
             elif phase == 2:
-                phase_price = min(price + config.PHASE2_INCREMENT_CENTS / 100, 0.99)
+                increment = config.PHASE2_INCREMENT_CENTS / 100
+                if side == "BUY":
+                    phase_price = min(price + increment, 0.99)
+                else:
+                    phase_price = max(price - increment, 0.01)
                 remaining_size *= 0.95
                 timeout = config.PHASE2_TIMEOUT_S
             else:
-                phase_price = min(
-                    price
-                    + (config.PHASE2_INCREMENT_CENTS + config.PHASE3_INCREMENT_CENTS)
-                    / 100,
-                    0.99,
-                )
+                increment = (config.PHASE2_INCREMENT_CENTS + config.PHASE3_INCREMENT_CENTS) / 100
+                if side == "BUY":
+                    phase_price = min(price + increment, 0.99)
+                else:
+                    phase_price = max(price - increment, 0.01)
                 remaining_size *= 0.95
                 timeout = config.PHASE3_TIMEOUT_S
 
